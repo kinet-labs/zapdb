@@ -1,6 +1,8 @@
-module github.com/dgraph-io/badger/v4
+module github.com/kinet-labs/zapdb/v4
 
-go 1.26.3
+go 1.23.0
+
+toolchain go1.25.0
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0

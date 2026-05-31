@@ -23,9 +23,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/dgraph-io/badger/v4/options"
-	"github.com/dgraph-io/badger/v4/pb"
-	"github.com/dgraph-io/badger/v4/y"
+	"github.com/kinet-labs/zapdb/v4/options"
+	"github.com/kinet-labs/zapdb/v4/pb"
+	"github.com/kinet-labs/zapdb/v4/y"
 	"github.com/dgraph-io/ristretto/v2/z"
 )
 

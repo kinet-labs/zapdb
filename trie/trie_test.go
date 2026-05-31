@@ -11,7 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/dgraph-io/badger/v4/pb"
+	"github.com/kinet-labs/zapdb/v4/pb"
 )
 
 func TestGet(t *testing.T) {
