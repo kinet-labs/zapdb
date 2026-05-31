@@ -39,7 +39,6 @@ effects of those using Badger in applications built with older versions of Go.
   - [Getting Started](#getting-started)
     - [Installing](#installing)
       - [Installing Badger Command Line Tool](#installing-badger-command-line-tool)
-      - [Choosing a version](#choosing-a-version)
   - [Badger Documentation](#badger-documentation)
   - [Resources](#resources)
     - [Blog Posts](#blog-posts)
@@ -47,6 +46,8 @@ effects of those using Badger in applications built with older versions of Go.
     - [Comparisons](#comparisons)
     - [Benchmarks](#benchmarks)
   - [Projects Using Badger](#projects-using-badger)
+    - [Platform Compatibility](#platform-compatibility)
+  - [Encrypted Streaming Replication](#encrypted-streaming-replication)
   - [Contributing](#contributing)
   - [Contact](#contact)
 
@@ -270,6 +271,39 @@ For **non-POSIX platforms**, be aware of potential limitations:
 
 If you encounter issues on these platforms, review the corresponding `dir_*.go` source file for
 implementation details.
+
+## Encrypted Streaming Replication
+
+The Replicator continuously streams incremental backups to S3, encrypted with
+`kinet-labs/age` (X25519, upgradeable to X-Wing/ML-KEM-768). Data is serialized in
+the ZAP binary format (not protobuf).
+
+File extensions: `.zap` (plaintext), `.zap.age` (encrypted).
+
+S3 path convention: `{prefix}/{service}/{pod}/{version}.zap.age`
+
+Compatible with `hanzoai/s3` (MinIO).
+
+```go
+import "github.com/kinet-labs/zapdb/v4"
+
+r, _ := zapdb.NewReplicator(db, zapdb.ReplicatorConfig{
+    Bucket:       "my-bucket",
+    Endpoint:     "s3.local:9000",
+    AccessKey:    os.Getenv("S3_ACCESS_KEY"),
+    SecretKey:    os.Getenv("S3_SECRET_KEY"),
+    Path:         "zapdb/node-0",
+    AgeRecipient: recipient, // kinet-labs/age X25519 or X-Wing
+    Interval:     time.Second,
+})
+go r.Start(ctx)
+defer r.Stop()
+
+// Restore:
+r.Restore(ctx)
+```
+
+6 tests cover replication, encryption round-trip, and restore.
 
 ## Contributing
 
