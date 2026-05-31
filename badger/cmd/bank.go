@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2018 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package cmd
@@ -9,23 +20,21 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	stderrors "errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
-	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/dgraph-io/badger/v2"
+	"github.com/dgraph-io/badger/v2/options"
+	"github.com/dgraph-io/badger/v2/pb"
+	"github.com/dgraph-io/badger/v2/y"
 	"github.com/spf13/cobra"
-
-	"github.com/kinet-labs/zapdb"
-	"github.com/kinet-labs/zapdb/pb"
-	"github.com/kinet-labs/zapdb/y"
-	"github.com/dgraph-io/ristretto/v2/z"
 )
 
 var testCmd = &cobra.Command{
@@ -59,7 +68,8 @@ var (
 	numAccounts     int
 	numPrevious     int
 	duration        string
-	stopAll         atomic.Int32
+	stopAll         int32
+	mmap            bool
 	checkStream     bool
 	checkSubscriber bool
 	verbose         bool
@@ -81,6 +91,7 @@ func init() {
 	bankTest.Flags().IntVarP(
 		&numGoroutines, "conc", "c", 16, "Number of concurrent transactions to run.")
 	bankTest.Flags().StringVarP(&duration, "duration", "d", "3m", "How long to run the test.")
+	bankTest.Flags().BoolVarP(&mmap, "mmap", "m", false, "If true, mmap LSM tree. Default is RAM.")
 	bankTest.Flags().BoolVarP(&checkStream, "check_stream", "s", false,
 		"If true, the test will send transactions to another badger instance via the stream "+
 			"interface in order to verify that all data is streamed correctly.")
@@ -106,7 +117,7 @@ func key(account int) []byte {
 func toUint64(val []byte) uint64 {
 	u, err := strconv.ParseUint(string(val), 10, 64)
 	y.Check(err)
-	return u
+	return uint64(u)
 }
 
 func toSlice(bal uint64) []byte {
@@ -114,7 +125,7 @@ func toSlice(bal uint64) []byte {
 }
 
 func getBalance(txn *badger.Txn, account int) (uint64, error) {
-	item, err := get(txn, key(account))
+	item, err := txn.Get(key(account))
 	if err != nil {
 		return 0, err
 	}
@@ -138,7 +149,7 @@ func min(a, b uint64) uint64 {
 	return b
 }
 
-var errAbandoned = stderrors.New("Transaction abandoned due to insufficient balance")
+var errAbandoned = errors.New("Transaction abandonded due to insufficient balance")
 
 func moveMoney(db *badger.DB, from, to int) error {
 	return db.Update(func(txn *badger.Txn) error {
@@ -186,33 +197,14 @@ func diff(a, b []account) string {
 
 var errFailure = errors.New("test failed due to balance mismatch")
 
-// get function will fetch the value for the key "k" either by using the
-// txn.Get API or the iterator.Seek API.
-func get(txn *badger.Txn, k []byte) (*badger.Item, error) {
-	if rand.Int()%2 == 0 {
-		return txn.Get(k)
-	}
-
-	iopt := badger.DefaultIteratorOptions
-	// PrefectValues is expensive. We don't need it here.
-	iopt.PrefetchValues = false
-	it := txn.NewIterator(iopt)
-	defer it.Close()
-	it.Seek(k)
-	if it.Valid() {
-		return it.Item(), nil
-	}
-	return nil, badger.ErrKeyNotFound
-}
-
-// seekTotal retrieves the total of all accounts by seeking for each account key.
+// seekTotal retrives the total of all accounts by seeking for each account key.
 func seekTotal(txn *badger.Txn) ([]account, error) {
-	expected := uint64(numAccounts) * initialBal
+	expected := uint64(numAccounts) * uint64(initialBal)
 	var accounts []account
 
 	var total uint64
 	for i := 0; i < numAccounts; i++ {
-		item, err := get(txn, key(i))
+		item, err := txn.Get(key(i))
 		if err != nil {
 			log.Printf("Error for account: %d. err=%v. key=%q\n", i, err, key(i))
 			return accounts, err
@@ -231,7 +223,7 @@ func seekTotal(txn *badger.Txn) ([]account, error) {
 	if total != expected {
 		log.Printf("Balance did NOT match up. Expected: %d. Received: %d",
 			expected, total)
-		stopAll.Add(1)
+		atomic.AddInt32(&stopAll, 1)
 		return accounts, errFailure
 	}
 	return accounts, nil
@@ -297,12 +289,11 @@ func compareTwo(db *badger.DB, before, after uint64) {
 
 func runDisect(cmd *cobra.Command, args []string) error {
 	// The total did not match up. So, let's disect the DB to find the
-	// transaction which caused the total mismatch.
+	// transction which caused the total mismatch.
 	db, err := badger.OpenManaged(badger.DefaultOptions(sstDir).
 		WithValueDir(vlogDir).
 		WithReadOnly(true).
-		WithEncryptionKey([]byte(encryptionKey)).
-		WithIndexCacheSize(1 << 30))
+		WithEncryptionKey([]byte(encryptionKey)))
 	if err != nil {
 		return err
 	}
@@ -347,13 +338,14 @@ func runTest(cmd *cobra.Command, args []string) error {
 	// Open DB
 	opts := badger.DefaultOptions(sstDir).
 		WithValueDir(vlogDir).
-		// Do not GC any versions, because we need them for the disect.
+		WithMaxTableSize(4 << 20). // Force more compactions.
+		WithNumLevelZeroTables(2).
+		WithNumMemtables(2).
+		// Do not GC any versions, because we need them for the disect..
 		WithNumVersionsToKeep(int(math.MaxInt32)).
-		WithBlockCacheSize(1 << 30).
-		WithIndexCacheSize(1 << 30)
-
-	if verbose {
-		opts = opts.WithLoggingLevel(badger.DEBUG)
+		WithValueThreshold(1) // Make all values go to value log
+	if mmap {
+		opts = opts.WithTableLoadingMode(options.MemoryMap)
 	}
 
 	if encryptionKey != "" {
@@ -372,7 +364,7 @@ func runTest(cmd *cobra.Command, args []string) error {
 	var tmpDb *badger.DB
 	var subscribeDB *badger.DB
 	if checkSubscriber {
-		dir, err := os.MkdirTemp("", "bank_subscribe")
+		dir, err := ioutil.TempDir("", "bank_subscribe")
 		y.Check(err)
 
 		subscribeDB, err = badger.Open(badger.DefaultOptions(dir).WithSyncWrites(false))
@@ -383,7 +375,7 @@ func runTest(cmd *cobra.Command, args []string) error {
 	}
 
 	if checkStream {
-		dir, err := os.MkdirTemp("", "bank_stream")
+		dir, err := ioutil.TempDir("", "bank_stream")
 		y.Check(err)
 
 		tmpDb, err = badger.Open(badger.DefaultOptions(dir).WithSyncWrites(false))
@@ -409,7 +401,7 @@ func runTest(cmd *cobra.Command, args []string) error {
 
 	// startTs := time.Now()
 	endTs := time.Now().Add(dur)
-	var total, errors, reads atomic.Uint64
+	var total, errors, reads uint64
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -419,15 +411,15 @@ func runTest(cmd *cobra.Command, args []string) error {
 		defer ticker.Stop()
 
 		for range ticker.C {
-			if stopAll.Load() > 0 {
+			if atomic.LoadInt32(&stopAll) > 0 {
 				// Do not proceed.
 				return
 			}
 			// log.Printf("[%6s] Total: %d. Errors: %d Reads: %d.\n",
 			// 	time.Since(startTs).Round(time.Second).String(),
-			// 	total.Load(),
-			// 	errors.Load(),
-			// 	reads.Load())
+			// 	atomic.LoadUint64(&total),
+			// 	atomic.LoadUint64(&errors),
+			// 	atomic.LoadUint64(&reads))
 			if time.Now().After(endTs) {
 				return
 			}
@@ -444,7 +436,7 @@ func runTest(cmd *cobra.Command, args []string) error {
 			defer ticker.Stop()
 
 			for range ticker.C {
-				if stopAll.Load() > 0 {
+				if atomic.LoadInt32(&stopAll) > 0 {
 					// Do not proceed.
 					return
 				}
@@ -457,11 +449,11 @@ func runTest(cmd *cobra.Command, args []string) error {
 					continue
 				}
 				err := moveMoney(db, from, to)
-				total.Add(1)
+				atomic.AddUint64(&total, 1)
 				if err == nil && verbose {
 					log.Printf("Moved $5. %d -> %d\n", from, to)
 				} else {
-					errors.Add(1)
+					atomic.AddUint64(&errors, 1)
 				}
 			}
 		}()
@@ -479,7 +471,7 @@ func runTest(cmd *cobra.Command, args []string) error {
 				log.Printf("Received stream\n")
 
 				// Do not proceed.
-				if stopAll.Load() > 0 || time.Now().After(endTs) {
+				if atomic.LoadInt32(&stopAll) > 0 || time.Now().After(endTs) {
 					return
 				}
 
@@ -490,15 +482,13 @@ func runTest(cmd *cobra.Command, args []string) error {
 				batch := tmpDb.NewWriteBatch()
 
 				stream := db.NewStream()
-				stream.Send = func(buf *z.Buffer) error {
-					err := buf.SliceIterate(func(s []byte) error {
-						var kv pb.KV
-						if err := pb.Unmarshal(s, &kv); err != nil {
+				stream.Send = func(list *pb.KVList) error {
+					for _, kv := range list.Kv {
+						if err := batch.Set(kv.Key, kv.Value); err != nil {
 							return err
 						}
-						return batch.Set(kv.Key, kv.Value)
-					})
-					return err
+					}
+					return nil
 				}
 				y.Check(stream.Orchestrate(context.Background()))
 				y.Check(batch.Flush())
@@ -523,7 +513,7 @@ func runTest(cmd *cobra.Command, args []string) error {
 		defer ticker.Stop()
 
 		for range ticker.C {
-			if stopAll.Load() > 0 {
+			if atomic.LoadInt32(&stopAll) > 0 {
 				// Do not proceed.
 				return
 			}
@@ -536,7 +526,7 @@ func runTest(cmd *cobra.Command, args []string) error {
 				if err != nil {
 					log.Printf("Error while calculating total: %v", err)
 				} else {
-					reads.Add(1)
+					atomic.AddUint64(&reads, 1)
 				}
 				return nil
 			}))
@@ -550,9 +540,9 @@ func runTest(cmd *cobra.Command, args []string) error {
 		subWg.Add(1)
 		go func() {
 			defer subWg.Done()
-			accountIDS := []pb.Match{}
+			accountIDS := [][]byte{}
 			for i := 0; i < numAccounts; i++ {
-				accountIDS = append(accountIDS, pb.Match{Prefix: key(i), IgnoreBytes: ""})
+				accountIDS = append(accountIDS, key(i))
 			}
 			updater := func(kvs *pb.KVList) error {
 				batch := subscribeDB.NewWriteBatch()
@@ -562,7 +552,7 @@ func runTest(cmd *cobra.Command, args []string) error {
 
 				return batch.Flush()
 			}
-			_ = db.Subscribe(ctx, updater, accountIDS)
+			_ = db.Subscribe(ctx, updater, accountIDS...)
 		}()
 	}
 
@@ -576,13 +566,13 @@ func runTest(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				log.Printf("Error while calculating subscriber DB total: %v", err)
 			} else {
-				reads.Add(1)
+				atomic.AddUint64(&reads, 1)
 			}
 			return nil
 		}))
 	}
 
-	if stopAll.Load() == 0 {
+	if atomic.LoadInt32(&stopAll) == 0 {
 		log.Println("Test OK")
 		return nil
 	}

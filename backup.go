@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
@@ -10,12 +21,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"fmt"
 	"io"
 
-	"github.com/kinet-labs/zapdb/pb"
-	"github.com/kinet-labs/zapdb/y"
-	"github.com/dgraph-io/ristretto/v2/z"
+	"github.com/dgraph-io/badger/v2/pb"
+	"github.com/dgraph-io/badger/v2/y"
+	"github.com/golang/protobuf/proto"
 )
 
 // flushThreshold determines when a buffer will be flushed. When performing a
@@ -24,52 +34,41 @@ import (
 // than the maxBatchSize.
 const flushThreshold = 100 << 20
 
-// Backup dumps a ZAP binary-encoded list of all entries in the database into the
-// given writer, that are newer than or equal to the specified version. It
-// returns a timestamp (version) indicating the version of last entry that is
-// dumped, which after incrementing by 1 can be passed into later invocation to
-// generate incremental backup of entries that have been added/modified since
-// the last invocation of DB.Backup().
-// DB.Backup is a wrapper function over Stream.Backup to generate full and
-// incremental backups of the DB. For more control over how many goroutines are
-// used to generate the backup, or if you wish to backup only a certain range
-// of keys, use Stream.Backup directly.
+// Backup is a wrapper function over Stream.Backup to generate full and incremental backups of the
+// DB. For more control over how many goroutines are used to generate the backup, or if you wish to
+// backup only a certain range of keys, use Stream.Backup directly.
 func (db *DB) Backup(w io.Writer, since uint64) (uint64, error) {
 	stream := db.NewStream()
 	stream.LogPrefix = "DB.Backup"
-	stream.SinceTs = since
 	return stream.Backup(w, since)
 }
 
-// Backup dumps a ZAP binary-encoded list of all entries in the database into the
-// given writer, that are newer than or equal to the specified version. It returns a
-// timestamp(version) indicating the version of last entry that was dumped, which
-// after incrementing by 1 can be passed into a later invocation to generate an
-// incremental dump of entries that have been added/modified since the last
-// invocation of Stream.Backup().
+// Backup dumps a protobuf-encoded list of all entries in the database into the
+// given writer, that are newer than the specified version. It returns a
+// timestamp indicating when the entries were dumped which can be passed into a
+// later invocation to generate an incremental dump, of entries that have been
+// added/modified since the last invocation of Stream.Backup().
 //
 // This can be used to backup the data in a database at a given point in time.
 func (stream *Stream) Backup(w io.Writer, since uint64) (uint64, error) {
 	stream.KeyToList = func(key []byte, itr *Iterator) (*pb.KVList, error) {
 		list := &pb.KVList{}
-		a := itr.Alloc
 		for ; itr.Valid(); itr.Next() {
 			item := itr.Item()
 			if !bytes.Equal(item.Key(), key) {
 				return list, nil
 			}
 			if item.Version() < since {
-				return nil, fmt.Errorf("Backup: Item Version: %d less than sinceTs: %d",
-					item.Version(), since)
+				// Ignore versions less than given timestamp, or skip older
+				// versions of the given key.
+				return list, nil
 			}
 
 			var valCopy []byte
 			if !item.IsDeletedOrExpired() {
 				// No need to copy value, if item is deleted or expired.
-				err := item.Value(func(val []byte) error {
-					valCopy = a.Copy(val)
-					return nil
-				})
+				var err error
+				valCopy, err = item.ValueCopy(nil)
 				if err != nil {
 					stream.db.opt.Errorf("Key [%x, %d]. Error while fetching value [%v]\n",
 						item.Key(), item.Version(), err)
@@ -79,14 +78,13 @@ func (stream *Stream) Backup(w io.Writer, since uint64) (uint64, error) {
 
 			// clear txn bits
 			meta := item.meta &^ (bitTxn | bitFinTxn)
-			kv := y.NewKV(a)
-			*kv = pb.KV{
-				Key:       a.Copy(item.Key()),
+			kv := &pb.KV{
+				Key:       item.KeyCopy(nil),
 				Value:     valCopy,
-				UserMeta:  a.Copy([]byte{item.UserMeta()}),
+				UserMeta:  []byte{item.UserMeta()},
 				Version:   item.Version(),
 				ExpiresAt: item.ExpiresAt(),
-				Meta:      a.Copy([]byte{meta}),
+				Meta:      []byte{meta},
 			}
 			list.Kv = append(list.Kv, kv)
 
@@ -109,22 +107,12 @@ func (stream *Stream) Backup(w io.Writer, since uint64) (uint64, error) {
 	}
 
 	var maxVersion uint64
-	stream.Send = func(buf *z.Buffer) error {
-		list, err := BufferToKVList(buf)
-		if err != nil {
-			return err
-		}
-		out := list.Kv[:0]
+	stream.Send = func(list *pb.KVList) error {
 		for _, kv := range list.Kv {
 			if maxVersion < kv.Version {
 				maxVersion = kv.Version
 			}
-			if !kv.StreamDone {
-				// Don't pick stream done changes.
-				out = append(out, kv)
-			}
 		}
-		list.Kv = out
 		return writeTo(list, w)
 	}
 
@@ -135,10 +123,10 @@ func (stream *Stream) Backup(w io.Writer, since uint64) (uint64, error) {
 }
 
 func writeTo(list *pb.KVList, w io.Writer) error {
-	if err := binary.Write(w, binary.LittleEndian, uint64(pb.Size(list))); err != nil {
+	if err := binary.Write(w, binary.LittleEndian, uint64(proto.Size(list))); err != nil {
 		return err
 	}
-	buf, err := pb.Marshal(list)
+	buf, err := proto.Marshal(list)
 	if err != nil {
 		return err
 	}
@@ -180,7 +168,7 @@ func (l *KVLoader) Set(kv *pb.KV) error {
 		ExpiresAt: kv.ExpiresAt,
 		meta:      meta,
 	}
-	estimatedSize := e.estimateSizeAndSetThreshold(l.db.valueThreshold())
+	estimatedSize := int64(e.estimateSize(l.db.opt.ValueThreshold))
 	// Flush entries if inserting the next entry would overflow the transactional limits.
 	if int64(len(l.entries))+1 >= l.db.opt.maxBatchCount ||
 		l.entriesSize+estimatedSize >= l.db.opt.maxBatchSize ||
@@ -221,7 +209,7 @@ func (l *KVLoader) Finish() error {
 	return l.throttle.Finish()
 }
 
-// Load reads a ZAP binary-encoded list of all entries from a reader and writes
+// Load reads a protobuf-encoded list of all entries from a reader and writes
 // them to the database. This can be used to restore the database from a backup
 // made by calling DB.Backup(). If more complex logic is needed to restore a badger
 // backup, the KVLoader interface should be used instead.
@@ -251,7 +239,7 @@ func (db *DB) Load(r io.Reader, maxPendingWrites int) error {
 		}
 
 		list := &pb.KVList{}
-		if err := pb.Unmarshal(unmarshalBuf[:sz], list); err != nil {
+		if err := proto.Unmarshal(unmarshalBuf[:sz], list); err != nil {
 			return err
 		}
 

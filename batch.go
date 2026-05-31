@@ -1,19 +1,27 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2018 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
 
 import (
-	"errors"
-	"fmt"
 	"sync"
-	"sync/atomic"
 
-	"github.com/kinet-labs/zapdb/pb"
-	"github.com/kinet-labs/zapdb/y"
-	"github.com/dgraph-io/ristretto/v2/z"
+	"github.com/dgraph-io/badger/v2/pb"
+	"github.com/dgraph-io/badger/v2/y"
+	"github.com/pkg/errors"
 )
 
 // WriteBatch holds the necessary info to perform batched writes.
@@ -22,11 +30,10 @@ type WriteBatch struct {
 	txn      *Txn
 	db       *DB
 	throttle *y.Throttle
-	err      atomic.Value
+	err      error
 
 	isManaged bool
 	commitTs  uint64
-	finished  bool
 }
 
 // NewWriteBatch creates a new WriteBatch. This provides a way to conveniently do a lot of writes,
@@ -65,9 +72,6 @@ func (wb *WriteBatch) SetMaxPendingTxns(max int) {
 //
 // Note that any committed writes would still go through despite calling Cancel.
 func (wb *WriteBatch) Cancel() {
-	wb.Lock()
-	defer wb.Unlock()
-	wb.finished = true
 	if err := wb.throttle.Finish(); err != nil {
 		wb.db.opt.Errorf("WatchBatch.Cancel error while finishing: %v", err)
 	}
@@ -80,41 +84,26 @@ func (wb *WriteBatch) callback(err error) {
 	if err == nil {
 		return
 	}
-	if err := wb.Error(); err != nil {
-		return
-	}
-	wb.err.Store(err)
-}
 
-func (wb *WriteBatch) writeKV(kv *pb.KV) error {
-	e := Entry{Key: kv.Key, Value: kv.Value}
-	if len(kv.UserMeta) > 0 {
-		e.UserMeta = kv.UserMeta[0]
-	}
-	y.AssertTrue(kv.Version != 0)
-	e.version = kv.Version
-	return wb.handleEntry(&e)
-}
-
-func (wb *WriteBatch) Write(buf *z.Buffer) error {
 	wb.Lock()
 	defer wb.Unlock()
-
-	err := buf.SliceIterate(func(s []byte) error {
-		kv := &pb.KV{}
-		if err := pb.Unmarshal(s, kv); err != nil {
-			return err
-		}
-		return wb.writeKV(kv)
-	})
-	return err
+	if wb.err != nil {
+		return
+	}
+	wb.err = err
 }
 
-func (wb *WriteBatch) WriteList(kvList *pb.KVList) error {
+func (wb *WriteBatch) Write(kvList *pb.KVList) error {
 	wb.Lock()
 	defer wb.Unlock()
 	for _, kv := range kvList.Kv {
-		if err := wb.writeKV(kv); err != nil {
+		e := Entry{Key: kv.Key, Value: kv.Value}
+		if len(kv.UserMeta) > 0 {
+			e.UserMeta = kv.UserMeta[0]
+		}
+		y.AssertTrue(kv.Version != 0)
+		e.version = kv.Version
+		if err := wb.handleEntry(&e); err != nil {
 			return err
 		}
 	}
@@ -143,7 +132,7 @@ func (wb *WriteBatch) handleEntry(e *Entry) error {
 	// This time the error must not be ErrTxnTooBig, otherwise, we make the
 	// error permanent.
 	if err := wb.txn.SetEntry(e); err != nil {
-		wb.err.Store(err)
+		wb.err = err
 		return err
 	}
 	return nil
@@ -180,7 +169,7 @@ func (wb *WriteBatch) Delete(k []byte) error {
 		return err
 	}
 	if err := wb.txn.Delete(k); err != nil {
-		wb.err.Store(err)
+		wb.err = err
 		return err
 	}
 	return nil
@@ -188,48 +177,36 @@ func (wb *WriteBatch) Delete(k []byte) error {
 
 // Caller to commit must hold a write lock.
 func (wb *WriteBatch) commit() error {
-	if err := wb.Error(); err != nil {
-		return err
-	}
-	if wb.finished {
-		return y.ErrCommitAfterFinish
+	if wb.err != nil {
+		return wb.err
 	}
 	if err := wb.throttle.Do(); err != nil {
-		wb.err.Store(err)
 		return err
 	}
 	wb.txn.CommitWith(wb.callback)
 	wb.txn = wb.db.newTransaction(true, wb.isManaged)
 	wb.txn.commitTs = wb.commitTs
-	return wb.Error()
+	return wb.err
 }
 
 // Flush must be called at the end to ensure that any pending writes get committed to Badger. Flush
 // returns any error stored by WriteBatch.
 func (wb *WriteBatch) Flush() error {
 	wb.Lock()
-	err := wb.commit()
-	if err != nil {
-		wb.Unlock()
-		return err
-	}
-	wb.finished = true
+	_ = wb.commit()
 	wb.txn.Discard()
 	wb.Unlock()
 
 	if err := wb.throttle.Finish(); err != nil {
-		if wb.Error() != nil {
-			return fmt.Errorf("wb.err: %w err: %w", wb.Error(), err)
-		}
 		return err
 	}
 
-	return wb.Error()
+	return wb.err
 }
 
 // Error returns any errors encountered so far. No commits would be run once an error is detected.
 func (wb *WriteBatch) Error() error {
-	// If the interface conversion fails, the err will be nil.
-	err, _ := wb.err.Load().(error)
-	return err
+	wb.Lock()
+	defer wb.Unlock()
+	return wb.err
 }

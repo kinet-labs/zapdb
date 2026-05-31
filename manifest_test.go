@@ -1,30 +1,41 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
 
 import (
 	"fmt"
+	"io/ioutil"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
-	"sync"
 	"testing"
-	"time"
 
+	"golang.org/x/net/trace"
+
+	"github.com/dgraph-io/badger/v2/options"
+	"github.com/dgraph-io/badger/v2/pb"
+	"github.com/dgraph-io/badger/v2/table"
+	"github.com/dgraph-io/badger/v2/y"
 	"github.com/stretchr/testify/require"
-
-	"github.com/kinet-labs/zapdb/options"
-	"github.com/kinet-labs/zapdb/pb"
-	"github.com/kinet-labs/zapdb/table"
-	"github.com/kinet-labs/zapdb/y"
 )
 
 func TestManifestBasic(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 
@@ -41,7 +52,7 @@ func TestManifestBasic(t *testing.T) {
 			txnSet(t, kv, k, k, 0x00)
 		}
 		txnSet(t, kv, []byte("testkey"), []byte("testval"), 0x05)
-		require.NoError(t, kv.validate())
+		kv.validate()
 		require.NoError(t, kv.Close())
 	}
 
@@ -59,7 +70,7 @@ func TestManifestBasic(t *testing.T) {
 }
 
 func helpTestManifestFileCorruption(t *testing.T, off int64, errorContent string) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 
@@ -90,7 +101,7 @@ func TestManifestMagic(t *testing.T) {
 }
 
 func TestManifestVersion(t *testing.T) {
-	helpTestManifestFileCorruption(t, 6, "unsupported version")
+	helpTestManifestFileCorruption(t, 4, "unsupported version")
 }
 
 func TestManifestChecksum(t *testing.T) {
@@ -101,9 +112,20 @@ func key(prefix string, i int) string {
 	return prefix + fmt.Sprintf("%04d", i)
 }
 
+func buildTestTable(t *testing.T, prefix string, n int, opts table.Options) *os.File {
+	y.AssertTrue(n <= 10000)
+	keyValues := make([][]string, n)
+	for i := 0; i < n; i++ {
+		k := key(prefix, i)
+		v := fmt.Sprintf("%d", i)
+		keyValues[i] = []string{k, v}
+	}
+	return buildTable(t, keyValues, opts)
+}
+
 // TODO - Move these to somewhere where table package can also use it.
 // keyValues is n by 2 where n is number of pairs.
-func buildTable(t *testing.T, keyValues [][]string, bopts table.Options) *table.Table {
+func buildTable(t *testing.T, keyValues [][]string, bopts table.Options) *os.File {
 	if bopts.BloomFalsePositive == 0 {
 		bopts.BloomFalsePositive = 0.01
 	}
@@ -114,7 +136,13 @@ func buildTable(t *testing.T, keyValues [][]string, bopts table.Options) *table.
 	defer b.Close()
 	// TODO: Add test for file garbage collection here. No files should be left after the tests here.
 
-	filename := fmt.Sprintf("%s%s%d.sst", os.TempDir(), string(os.PathSeparator), rand.Uint32())
+	filename := fmt.Sprintf("%s%s%d.sst", os.TempDir(), string(os.PathSeparator), rand.Int63())
+	f, err := y.OpenSyncedFile(filename, true)
+	if t != nil {
+		require.NoError(t, err)
+	} else {
+		y.Check(err)
+	}
 
 	sort.Slice(keyValues, func(i, j int) bool {
 		return keyValues[i][0] < keyValues[j][0]
@@ -127,87 +155,67 @@ func buildTable(t *testing.T, keyValues [][]string, bopts table.Options) *table.
 			UserMeta: 0,
 		}, 0)
 	}
-
-	tbl, err := table.CreateTable(filename, b)
-	require.NoError(t, err)
-	return tbl
+	_, err = f.Write(b.Finish())
+	require.NoError(t, err, "unable to write to file.")
+	f.Close()
+	f, _ = y.OpenSyncedFile(filename, true)
+	return f
 }
 
 func TestOverlappingKeyRangeError(t *testing.T) {
-	// [Aman] This test is not making sense to me right now. When fixing warnings from
-	// linter, I realized that the runCompactDef function below always returns error.
-	t.Skip()
-
-	buildTestTable := func(t *testing.T, prefix string, n int, opts table.Options) *table.Table {
-		y.AssertTrue(n <= 10000)
-		keyValues := make([][]string, n)
-		for i := 0; i < n; i++ {
-			k := key(prefix, i)
-			v := fmt.Sprintf("%d", i)
-			keyValues[i] = []string{k, v}
-		}
-		return buildTable(t, keyValues, opts)
-	}
-
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 	kv, err := Open(DefaultOptions(dir))
 	require.NoError(t, err)
-	defer func() { require.NoError(t, kv.Close()) }()
+	defer kv.Close()
 
 	lh0 := newLevelHandler(kv, 0)
 	lh1 := newLevelHandler(kv, 1)
-	opts := table.Options{ChkMode: options.OnTableAndBlockRead}
-	t1 := buildTestTable(t, "k", 2, opts)
-	defer func() { require.NoError(t, t1.DecrRef()) }()
+	opts := table.Options{LoadingMode: options.MemoryMap, ChkMode: options.OnTableAndBlockRead}
+	f := buildTestTable(t, "k", 2, opts)
+	t1, err := table.OpenTable(f, opts)
+	require.NoError(t, err)
+	defer t1.DecrRef()
 
 	done := lh0.tryAddLevel0Table(t1)
 	require.Equal(t, true, done)
+
 	cd := compactDef{
 		thisLevel: lh0,
 		nextLevel: lh1,
-		t:         kv.lc.levelTargets(),
+		elog:      trace.New("Badger", "Compact"),
 	}
-	cd.t.baseLevel = 1
 
 	manifest := createManifest()
 	lc, err := newLevelsController(kv, &manifest)
 	require.NoError(t, err)
 	done = lc.fillTablesL0(&cd)
 	require.Equal(t, true, done)
-	require.NoError(t, lc.runCompactDef(-1, 0, cd))
+	lc.runCompactDef(0, cd)
 
-	t2 := buildTestTable(t, "l", 2, opts)
-	defer func() { require.NoError(t, t2.DecrRef()) }()
+	f = buildTestTable(t, "l", 2, opts)
+	t2, err := table.OpenTable(f, opts)
+	require.NoError(t, err)
+	defer t2.DecrRef()
 	done = lh0.tryAddLevel0Table(t2)
 	require.Equal(t, true, done)
 
 	cd = compactDef{
 		thisLevel: lh0,
 		nextLevel: lh1,
-		t:         kv.lc.levelTargets(),
+		elog:      trace.New("Badger", "Compact"),
 	}
-	cd.t.baseLevel = 1
 	lc.fillTablesL0(&cd)
-	require.NoError(t, lc.runCompactDef(-1, 0, cd))
+	lc.runCompactDef(0, cd)
 }
 
 func TestManifestRewrite(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
-
-	db, err := Open(DefaultOptions(dir))
-	require.NoError(t, err, "error while opening db")
-
-	defer func() {
-		require.NoError(t, db.Close())
-		removeDir(dir)
-	}()
-
+	defer removeDir(dir)
 	deletionsThreshold := 10
-
-	mf, m, err := helpOpenOrCreateManifestFile(dir, false, 0, deletionsThreshold, db.opt)
+	mf, m, err := helpOpenOrCreateManifestFile(dir, false, deletionsThreshold)
 	defer func() {
 		if mf != nil {
 			mf.close()
@@ -219,7 +227,7 @@ func TestManifestRewrite(t *testing.T) {
 
 	err = mf.addChanges([]*pb.ManifestChange{
 		newCreateChange(0, 0, 0, 0),
-	}, db.opt)
+	})
 	require.NoError(t, err)
 
 	for i := uint64(0); i < uint64(deletionsThreshold*3); i++ {
@@ -227,59 +235,15 @@ func TestManifestRewrite(t *testing.T) {
 			newCreateChange(i+1, 0, 0, 0),
 			newDeleteChange(i),
 		}
-		err := mf.addChanges(ch, db.opt)
+		err := mf.addChanges(ch)
 		require.NoError(t, err)
 	}
 	err = mf.close()
 	require.NoError(t, err)
 	mf = nil
-	mf, m, err = helpOpenOrCreateManifestFile(dir, false, 0, deletionsThreshold, db.opt)
+	mf, m, err = helpOpenOrCreateManifestFile(dir, false, deletionsThreshold)
 	require.NoError(t, err)
 	require.Equal(t, map[uint64]TableManifest{
 		uint64(deletionsThreshold * 3): {Level: 0},
 	}, m.Tables)
-}
-
-func TestConcurrentManifestCompaction(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
-	require.NoError(t, err)
-	defer removeDir(dir)
-
-	db, err := Open(DefaultOptions(dir))
-	require.NoError(t, err, "error while opening db")
-	defer func() {
-		require.NoError(t, db.Close())
-	}()
-
-	// overwrite the sync function to make this race condition easily reproducible
-	syncFunc = func(f *os.File) error {
-		// effectively making the Sync() take around 1s makes this reproduce every time
-		time.Sleep(1 * time.Second)
-		return f.Sync()
-	}
-
-	mf, _, err := helpOpenOrCreateManifestFile(dir, false, 0, 0, db.opt)
-	require.NoError(t, err)
-
-	cs := &pb.ManifestChangeSet{}
-	for i := uint64(0); i < 1000; i++ {
-		cs.Changes = append(cs.Changes,
-			newCreateChange(i, 0, 0, 0),
-			newDeleteChange(i),
-		)
-	}
-
-	// simulate 2 concurrent compaction threads
-	n := 2
-	wg := sync.WaitGroup{}
-	wg.Add(n)
-	for i := 0; i < n; i++ {
-		go func() {
-			defer wg.Done()
-			require.NoError(t, mf.addChanges(cs.Changes, db.opt))
-		}()
-	}
-	wg.Wait()
-
-	require.NoError(t, mf.close())
 }

@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package cmd
@@ -9,37 +20,34 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
-	"io/fs"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/dustin/go-humanize"
-	"github.com/spf13/cobra"
+	"github.com/pkg/errors"
 
-	"github.com/kinet-labs/zapdb"
-	"github.com/kinet-labs/zapdb/options"
-	"github.com/kinet-labs/zapdb/table"
-	"github.com/kinet-labs/zapdb/y"
+	"github.com/dgraph-io/badger/v2"
+	"github.com/dgraph-io/badger/v2/options"
+	"github.com/dgraph-io/badger/v2/table"
+	"github.com/dgraph-io/badger/v2/y"
+	humanize "github.com/dustin/go-humanize"
+	"github.com/spf13/cobra"
 )
 
 type flagOptions struct {
-	showTables               bool
-	showHistogram            bool
-	showKeys                 bool
-	withPrefix               string
-	keyLookup                string
-	itemMeta                 bool
-	keyHistory               bool
-	showInternal             bool
-	readOnly                 bool
-	truncate                 bool
-	encryptionKey            string
-	checksumVerificationMode string
-	discard                  bool
-	externalMagicVersion     uint16
+	showTables    bool
+	showHistogram bool
+	showKeys      bool
+	withPrefix    string
+	keyLookup     string
+	itemMeta      bool
+	keyHistory    bool
+	showInternal  bool
+	readOnly      bool
+	truncate      bool
 }
 
 var (
@@ -66,13 +74,6 @@ func init() {
 		"to open DB.")
 	infoCmd.Flags().BoolVar(&opt.truncate, "truncate", false, "If set to true, it allows "+
 		"truncation of value log files if they have corrupt data.")
-	infoCmd.Flags().StringVar(&opt.encryptionKey, "enc-key", "", "Use the provided encryption key")
-	infoCmd.Flags().StringVar(&opt.checksumVerificationMode, "cv-mode", "none",
-		"[none, table, block, tableAndBlock] Specifies when the db should verify checksum for SST.")
-	infoCmd.Flags().BoolVar(&opt.discard, "discard", false,
-		"Parse and print DISCARD file from value logs.")
-	infoCmd.Flags().Uint16Var(&opt.externalMagicVersion, "external-magic", 0,
-		"External magic number")
 }
 
 var infoCmd = &cobra.Command{
@@ -88,35 +89,18 @@ to the Dgraph team.
 }
 
 func handleInfo(cmd *cobra.Command, args []string) error {
-	cvMode := checksumVerificationMode(opt.checksumVerificationMode)
-	bopt := badger.DefaultOptions(sstDir).
-		WithValueDir(vlogDir).
-		WithReadOnly(opt.readOnly).
-		WithBlockCacheSize(100 << 20).
-		WithIndexCacheSize(200 << 20).
-		WithEncryptionKey([]byte(opt.encryptionKey)).
-		WithChecksumVerificationMode(cvMode).
-		WithExternalMagic(opt.externalMagicVersion)
-
-	if opt.discard {
-		ds, err := badger.InitDiscardStats(bopt)
-		y.Check(err)
-		ds.Iterate(func(fid, stats uint64) {
-			fmt.Printf("Value Log Fid: %5d. Stats: %10d [ %s ]\n",
-				fid, stats, humanize.IBytes(stats))
-		})
-		fmt.Println("DONE")
-		return nil
-	}
-
-	if err := printInfo(sstDir, vlogDir, bopt); err != nil {
-		return y.Wrap(err, "failed to print information in MANIFEST file")
+	if err := printInfo(sstDir, vlogDir); err != nil {
+		return errors.Wrap(err, "failed to print information in MANIFEST file")
 	}
 
 	// Open DB
-	db, err := badger.Open(bopt)
+	db, err := badger.Open(badger.DefaultOptions(sstDir).
+		WithValueDir(vlogDir).
+		WithReadOnly(opt.readOnly).
+		WithTruncate(opt.truncate).
+		WithTableLoadingMode(options.MemoryMap))
 	if err != nil {
-		return y.Wrap(err, "failed to open database")
+		return errors.Wrap(err, "failed to open database")
 	}
 	defer db.Close()
 
@@ -126,7 +110,7 @@ func handleInfo(cmd *cobra.Command, args []string) error {
 
 	prefix, err := hex.DecodeString(opt.withPrefix)
 	if err != nil {
-		return y.Wrapf(err, "failed to decode hex prefix: %s", opt.withPrefix)
+		return errors.Wrapf(err, "failed to decode hex prefix: %s", opt.withPrefix)
 	}
 	if opt.showHistogram {
 		db.PrintHistogram(prefix)
@@ -140,7 +124,7 @@ func handleInfo(cmd *cobra.Command, args []string) error {
 
 	if len(opt.keyLookup) > 0 {
 		if err := lookup(db); err != nil {
-			return y.Wrapf(err, "failed to perform lookup for the key: %x", opt.keyLookup)
+			return errors.Wrapf(err, "failed to perform lookup for the key: %x", opt.keyLookup)
 		}
 	}
 	return nil
@@ -154,28 +138,24 @@ func showKeys(db *badger.DB, prefix []byte) error {
 	defer txn.Discard()
 
 	iopt := badger.DefaultIteratorOptions
-	iopt.Prefix = prefix
+	iopt.Prefix = []byte(prefix)
 	iopt.PrefetchValues = false
 	iopt.AllVersions = opt.keyHistory
 	iopt.InternalAccess = opt.showInternal
 	it := txn.NewIterator(iopt)
 	defer it.Close()
 
-	var totalKeys, totalSize int64
+	totalKeys := 0
 	for it.Rewind(); it.Valid(); it.Next() {
 		item := it.Item()
-		itemSize, err := printKeyReturnSize(item, false)
-		if err != nil {
-			return y.Wrapf(err, "failed to print information about key: %x(%d)",
+		if err := printKey(item, false); err != nil {
+			return errors.Wrapf(err, "failed to print information about key: %x(%d)",
 				item.Key(), item.Version())
 		}
-
 		totalKeys++
-		totalSize += itemSize
 	}
 	fmt.Print("\n[Summary]\n")
 	fmt.Println("Total Number of keys:", totalKeys)
-	fmt.Println("Total Size of key-value pairs:", totalSize)
 	return nil
 
 }
@@ -186,7 +166,7 @@ func lookup(db *badger.DB) error {
 
 	key, err := hex.DecodeString(opt.keyLookup)
 	if err != nil {
-		return y.Wrapf(err, "failed to decode key: %q", opt.keyLookup)
+		return errors.Wrapf(err, "failed to decode key: %q", opt.keyLookup)
 	}
 
 	iopts := badger.DefaultIteratorOptions
@@ -197,12 +177,12 @@ func lookup(db *badger.DB) error {
 
 	itr.Rewind()
 	if !itr.Valid() {
-		return fmt.Errorf("Unable to rewind to key:\n%s", hex.Dump(key))
+		return errors.Errorf("Unable to rewind to key:\n%s", hex.Dump(key))
 	}
 	fmt.Println()
 	item := itr.Item()
-	if _, err := printKeyReturnSize(item, true); err != nil {
-		return y.Wrapf(err, "failed to print information about key: %x(%d)",
+	if err := printKey(item, true); err != nil {
+		return errors.Wrapf(err, "failed to print information about key: %x(%d)",
 			item.Key(), item.Version())
 	}
 
@@ -216,20 +196,19 @@ func lookup(db *badger.DB) error {
 		if !bytes.Equal(key, item.Key()) {
 			break
 		}
-		if _, err := printKeyReturnSize(item, true); err != nil {
-			return y.Wrapf(err, "failed to print information about key: %x(%d)",
+		if err := printKey(item, true); err != nil {
+			return errors.Wrapf(err, "failed to print information about key: %x(%d)",
 				item.Key(), item.Version())
 		}
 	}
 	return nil
 }
 
-func printKeyReturnSize(item *badger.Item, showValue bool) (int64, error) {
+func printKey(item *badger.Item, showValue bool) error {
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "Key: %x\tversion: %d", item.Key(), item.Version())
-	size := item.EstimatedSize()
 	if opt.itemMeta {
-		fmt.Fprintf(&buf, "\tsize: %d\tmeta: b%04b", size, item.UserMeta())
+		fmt.Fprintf(&buf, "\tsize: %d\tmeta: b%04b", item.EstimatedSize(), item.UserMeta())
 	}
 	if item.IsDeletedOrExpired() {
 		buf.WriteString("\t{deleted}")
@@ -240,87 +219,40 @@ func printKeyReturnSize(item *badger.Item, showValue bool) (int64, error) {
 	if showValue {
 		val, err := item.ValueCopy(nil)
 		if err != nil {
-			return size, y.Wrapf(err,
+			return errors.Wrapf(err,
 				"failed to copy value of the key: %x(%d)", item.Key(), item.Version())
 		}
 		fmt.Fprintf(&buf, "\n\tvalue: %v", val)
 	}
 	fmt.Println(buf.String())
-	return size, nil
+	return nil
 }
 
 func hbytes(sz int64) string {
-	return humanize.IBytes(uint64(sz))
+	return humanize.Bytes(uint64(sz))
 }
 
 func dur(src, dst time.Time) string {
 	return humanize.RelTime(dst, src, "earlier", "later")
 }
 
-func getInfo(fileInfos []os.FileInfo, tid uint64) int64 {
-	fileName := table.IDToFilename(tid)
-	for _, fi := range fileInfos {
-		if filepath.Base(fi.Name()) == fileName {
-			return fi.Size()
-		}
-	}
-	return 0
-}
-
 func tableInfo(dir, valueDir string, db *badger.DB) {
 	// we want all tables with keys count here.
-	tables := db.Tables()
-	fileInfos, err := readDir(dir)
-	y.Check(err)
-
+	tables := db.Tables(true)
 	fmt.Println()
-	// Total keys includes the internal keys as well.
-	fmt.Println("SSTable [Li, Id, Total Keys] " +
-		"[Compression Ratio, StaleData Ratio, Uncompressed Size, Index Size, BF Size] " +
+	fmt.Println("SSTable [Li, Id, Total Keys including internal keys] " +
 		"[Left Key, Version -> Right Key, Version]")
-	totalIndex := uint64(0)
-	totalBloomFilter := uint64(0)
-	totalCompressionRatio := float64(0.0)
 	for _, t := range tables {
 		lk, lt := y.ParseKey(t.Left), y.ParseTs(t.Left)
 		rk, rt := y.ParseKey(t.Right), y.ParseTs(t.Right)
 
-		compressionRatio := float64(t.UncompressedSize) /
-			float64(getInfo(fileInfos, t.ID)-int64(t.IndexSz))
-		staleDataRatio := float64(t.StaleDataSize) / float64(t.UncompressedSize)
-		fmt.Printf("SSTable [L%d, %03d, %07d] [%.2f, %.2f, %s, %s, %s] [%20X, v%d -> %20X, v%d]\n",
-			t.Level, t.ID, t.KeyCount, compressionRatio, staleDataRatio,
-			hbytes(int64(t.UncompressedSize)), hbytes(int64(t.IndexSz)),
-			hbytes(int64(t.BloomFilterSize)), lk, lt, rk, rt)
-		totalIndex += uint64(t.IndexSz)
-		totalBloomFilter += uint64(t.BloomFilterSize)
-		totalCompressionRatio += compressionRatio
+		fmt.Printf("SSTable [L%d, %03d, %07d] [%20X, v%d -> %20X, v%d]\n",
+			t.Level, t.ID, t.KeyCount, lk, lt, rk, rt)
 	}
-	fmt.Println()
-	fmt.Printf("Total Index Size: %s\n", hbytes(int64(totalIndex)))
-	fmt.Printf("Total BloomFilter Size: %s\n", hbytes(int64(totalBloomFilter)))
-	fmt.Printf("Mean Compression Ratio: %.2f\n", totalCompressionRatio/float64(len(tables)))
 	fmt.Println()
 }
 
-func readDir(dir string) ([]fs.FileInfo, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	infos := make([]fs.FileInfo, 0, len(entries))
-	for _, entry := range entries {
-		var info fs.FileInfo
-		info, err = entry.Info()
-		if err != nil {
-			return nil, err
-		}
-		infos = append(infos, info)
-	}
-	return infos, err
-}
-
-func printInfo(dir, valueDir string, bopt badger.Options) error {
+func printInfo(dir, valueDir string) error {
 	if dir == "" {
 		return fmt.Errorf("--dir not supplied")
 	}
@@ -336,18 +268,17 @@ func printInfo(dir, valueDir string, bopt badger.Options) error {
 			fp.Close()
 		}
 	}()
-	manifest, truncOffset, err := badger.ReplayManifestFile(fp, opt.externalMagicVersion, bopt)
+	manifest, truncOffset, err := badger.ReplayManifestFile(fp)
 	if err != nil {
 		return err
 	}
 	fp.Close()
 	fp = nil
 
-	fileinfos, err := readDir(dir)
+	fileinfos, err := ioutil.ReadDir(dir)
 	if err != nil {
 		return err
 	}
-
 	fileinfoByName := make(map[string]os.FileInfo)
 	fileinfoMarked := make(map[string]bool)
 	for _, info := range fileinfos {
@@ -413,11 +344,10 @@ func printInfo(dir, valueDir string, bopt badger.Options) error {
 
 	valueDirFileinfos := fileinfos
 	if valueDir != dir {
-		valueDirFileinfos, err = readDir(valueDir)
+		valueDirFileinfos, err = ioutil.ReadDir(valueDir)
 		if err != nil {
 			return err
 		}
-
 	}
 
 	// If valueDir is different from dir, holds extra files in the value dir.
@@ -470,13 +400,13 @@ func printInfo(dir, valueDir string, bopt badger.Options) error {
 	}
 
 	fmt.Print("\n[Summary]\n")
-	totalSSTSize := int64(0)
+	totalIndexSize := int64(0)
 	for i, sz := range levelSizes {
 		fmt.Printf("Level %d size: %12s\n", i, hbytes(sz))
-		totalSSTSize += sz
+		totalIndexSize += sz
 	}
 
-	fmt.Printf("Total SST size: %10s\n", hbytes(totalSSTSize))
+	fmt.Printf("Total index size: %8s\n", hbytes(totalIndexSize))
 	fmt.Printf("Value log size: %10s\n", hbytes(valueLogSize))
 	fmt.Println()
 	totalExtra := numExtra + numValueDirExtra
@@ -513,21 +443,4 @@ func pluralFiles(count int) string {
 		return "file"
 	}
 	return "files"
-}
-
-func checksumVerificationMode(cvMode string) options.ChecksumVerificationMode {
-	switch cvMode {
-	case "none":
-		return options.NoVerification
-	case "table":
-		return options.OnTableRead
-	case "block":
-		return options.OnBlockRead
-	case "tableAndblock":
-		return options.OnTableAndBlockRead
-	default:
-		fmt.Printf("Invalid checksum verification mode: %s\n", cvMode)
-		os.Exit(1)
-	}
-	return options.NoVerification
 }

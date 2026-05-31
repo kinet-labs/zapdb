@@ -1,21 +1,31 @@
-//go:build !windows && !plan9 && !js && !wasip1 && !aix
-// +build !windows,!plan9,!js,!wasip1,!aix
+// +build !windows
 
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 
+	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
-
-	"github.com/kinet-labs/zapdb/y"
 )
 
 // directoryLockGuard holds a lock on a directory and a pid file inside.  The pid file isn't part
@@ -38,11 +48,11 @@ func acquireDirectoryLock(dirPath string, pidFileName string, readOnly bool) (
 	// chdir in the meantime.
 	absPidFilePath, err := filepath.Abs(filepath.Join(dirPath, pidFileName))
 	if err != nil {
-		return nil, y.Wrapf(err, "cannot get absolute path for pid lock file")
+		return nil, errors.Wrap(err, "cannot get absolute path for pid lock file")
 	}
 	f, err := os.Open(dirPath)
 	if err != nil {
-		return nil, y.Wrapf(err, "cannot open directory %q", dirPath)
+		return nil, errors.Wrapf(err, "cannot open directory %q", dirPath)
 	}
 	opts := unix.LOCK_EX | unix.LOCK_NB
 	if readOnly {
@@ -52,7 +62,7 @@ func acquireDirectoryLock(dirPath string, pidFileName string, readOnly bool) (
 	err = unix.Flock(int(f.Fd()), opts)
 	if err != nil {
 		f.Close()
-		return nil, y.Wrapf(err,
+		return nil, errors.Wrapf(err,
 			"Cannot acquire directory lock on %q.  Another process is using this Badger database.",
 			dirPath)
 	}
@@ -60,10 +70,10 @@ func acquireDirectoryLock(dirPath string, pidFileName string, readOnly bool) (
 	if !readOnly {
 		// Yes, we happily overwrite a pre-existing pid file.  We're the
 		// only read-write badger process using this directory.
-		err = os.WriteFile(absPidFilePath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0666)
+		err = ioutil.WriteFile(absPidFilePath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0666)
 		if err != nil {
 			f.Close()
-			return nil, y.Wrapf(err,
+			return nil, errors.Wrapf(err,
 				"Cannot write pid file %q", absPidFilePath)
 		}
 	}
@@ -96,13 +106,13 @@ func openDir(path string) (*os.File, error) { return os.Open(path) }
 func syncDir(dir string) error {
 	f, err := openDir(dir)
 	if err != nil {
-		return y.Wrapf(err, "While opening directory: %s.", dir)
+		return errors.Wrapf(err, "While opening directory: %s.", dir)
 	}
 
 	err = f.Sync()
 	closeErr := f.Close()
 	if err != nil {
-		return y.Wrapf(err, "While syncing directory: %s.", dir)
+		return errors.Wrapf(err, "While syncing directory: %s.", dir)
 	}
-	return y.Wrapf(closeErr, "While closing directory: %s.", dir)
+	return errors.Wrapf(closeErr, "While closing directory: %s.", dir)
 }

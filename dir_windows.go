@@ -1,9 +1,19 @@
-//go:build windows
 // +build windows
 
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
@@ -14,7 +24,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/kinet-labs/zapdb/y"
+	"github.com/pkg/errors"
 )
 
 // FILE_ATTRIBUTE_TEMPORARY - A file that is being used for temporary storage.
@@ -66,7 +76,7 @@ func acquireDirectoryLock(dirPath string, pidFileName string, readOnly bool) (*d
 	// chdir in the meantime.
 	absLockFilePath, err := filepath.Abs(filepath.Join(dirPath, pidFileName))
 	if err != nil {
-		return nil, y.Wrap(err, "Cannot get absolute path for pid lock file")
+		return nil, errors.Wrap(err, "Cannot get absolute path for pid lock file")
 	}
 
 	// This call creates a file handler in memory that only one process can use at a time. When
@@ -74,14 +84,14 @@ func acquireDirectoryLock(dirPath string, pidFileName string, readOnly bool) (*d
 	// FILE_ATTRIBUTE_TEMPORARY is used to tell Windows to try to create the handle in memory.
 	// FILE_FLAG_DELETE_ON_CLOSE is not specified in syscall_windows.go but tells Windows to delete
 	// the file when all processes holding the handler are closed.
-	// XXX: this works but it's a bit clunky. i'd prefer to use LockFileEx but it needs unsafe pkg.
+	// XXX: this works but it's a bit klunky. i'd prefer to use LockFileEx but it needs unsafe pkg.
 	h, err := syscall.CreateFile(
 		syscall.StringToUTF16Ptr(absLockFilePath), 0, 0, nil,
 		syscall.OPEN_ALWAYS,
 		uint32(FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE),
 		0)
 	if err != nil {
-		return nil, y.Wrapf(err,
+		return nil, errors.Wrapf(err,
 			"Cannot create lock file %q.  Another process is using this Badger database",
 			absLockFilePath)
 	}

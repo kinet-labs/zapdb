@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package y
@@ -8,39 +19,35 @@ package y
 import (
 	"bytes"
 	"encoding/binary"
-	stderrors "errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"math"
 	"os"
 	"reflect"
-	"strconv"
 	"sync"
 	"time"
 	"unsafe"
 
-	"github.com/kinet-labs/zapdb/pb"
-	"github.com/dgraph-io/ristretto/v2/z"
+	"github.com/pkg/errors"
 )
 
 var (
 	// ErrEOF indicates an end of file when trying to read from a memory mapped file
 	// and encountering the end of slice.
-	ErrEOF = stderrors.New("ErrEOF: End of file")
+	ErrEOF = errors.New("End of mapped region")
 
-	// ErrCommitAfterFinish indicates that write batch commit was called after
-	// finish
-	ErrCommitAfterFinish = stderrors.New("Batch commit not permitted after finish")
+	// ErrZstdCgo indicates that badger was built without cgo but ZSTD
+	// compression algorithm is being used for compression. ZSTD cannot work
+	// without CGO.
+	ErrZstdCgo = errors.New("zstd compression requires building badger with cgo enabled")
 )
-
-type Flags int
 
 const (
 	// Sync indicates that O_DSYNC should be set on the underlying file,
 	// ensuring that data writes do not return until the data is flushed
 	// to disk.
-	Sync Flags = 1 << iota
+	Sync = 1 << iota
 	// ReadOnly opens the underlying file on a read-only basis.
 	ReadOnly
 )
@@ -51,10 +58,13 @@ var (
 
 	// CastagnoliCrcTable is a CRC32 polynomial table
 	CastagnoliCrcTable = crc32.MakeTable(crc32.Castagnoli)
+
+	// Dummy channel for nil closers.
+	dummyCloserChan = make(chan struct{})
 )
 
 // OpenExistingFile opens an existing file, errors if it doesn't exist.
-func OpenExistingFile(filename string, flags Flags) (*os.File, error) {
+func OpenExistingFile(filename string, flags uint32) (*os.File, error) {
 	openFlags := os.O_RDWR
 	if flags&ReadOnly != 0 {
 		openFlags = os.O_RDONLY
@@ -95,11 +105,7 @@ func OpenTruncFile(filename string, sync bool) (*os.File, error) {
 
 // SafeCopy does append(a[:0], src...).
 func SafeCopy(a, src []byte) []byte {
-	b := append(a[:0], src...)
-	if b == nil {
-		return []byte{}
-	}
-	return b
+	return append(a[:0], src...)
 }
 
 // Copy copies a byte slice and returns the copied slice.
@@ -138,7 +144,7 @@ func CompareKeys(key1, key2 []byte) int {
 
 // ParseKey parses the actual key from the key bytes.
 func ParseKey(key []byte) []byte {
-	if len(key) < 8 {
+	if key == nil {
 		return nil
 	}
 
@@ -179,6 +185,63 @@ func FixedDuration(d time.Duration) string {
 		str = fmt.Sprintf("%02dh", int(d.Hours())) + str
 	}
 	return str
+}
+
+// Closer holds the two things we need to close a goroutine and wait for it to finish: a chan
+// to tell the goroutine to shut down, and a WaitGroup with which to wait for it to finish shutting
+// down.
+type Closer struct {
+	closed    chan struct{}
+	waiting   sync.WaitGroup
+	closeOnce sync.Once
+}
+
+// NewCloser constructs a new Closer, with an initial count on the WaitGroup.
+func NewCloser(initial int) *Closer {
+	ret := &Closer{closed: make(chan struct{})}
+	ret.waiting.Add(initial)
+	return ret
+}
+
+// AddRunning Add()'s delta to the WaitGroup.
+func (lc *Closer) AddRunning(delta int) {
+	lc.waiting.Add(delta)
+}
+
+// Signal signals the HasBeenClosed signal.
+func (lc *Closer) Signal() {
+	// Todo(ibrahim): Change Signal to return error on next badger breaking change.
+	lc.closeOnce.Do(func() {
+		close(lc.closed)
+	})
+}
+
+// HasBeenClosed gets signaled when Signal() is called.
+func (lc *Closer) HasBeenClosed() <-chan struct{} {
+	if lc == nil {
+		return dummyCloserChan
+	}
+	return lc.closed
+}
+
+// Done calls Done() on the WaitGroup.
+func (lc *Closer) Done() {
+	if lc == nil {
+		return
+	}
+	lc.waiting.Done()
+}
+
+// Wait waits on the WaitGroup.  (It waits for NewCloser's initial value, AddRunning, and Done
+// calls to balance out.)
+func (lc *Closer) Wait() {
+	lc.waiting.Wait()
+}
+
+// SignalAndWait calls Signal(), then Wait().
+func (lc *Closer) SignalAndWait() {
+	lc.Signal()
+	lc.Wait()
 }
 
 // Throttle allows a limited number of workers to run at a time. It also
@@ -250,18 +313,6 @@ func (t *Throttle) Finish() error {
 	return t.finishErr
 }
 
-// U16ToBytes converts the given Uint16 to bytes
-func U16ToBytes(v uint16) []byte {
-	var uBuf [2]byte
-	binary.BigEndian.PutUint16(uBuf[:], v)
-	return uBuf[:]
-}
-
-// BytesToU16 converts the given byte slice to uint16
-func BytesToU16(b []byte) uint16 {
-	return binary.BigEndian.Uint16(b)
-}
-
 // U32ToBytes converts the given Uint32 to bytes
 func U32ToBytes(v uint32) []byte {
 	var uBuf [4]byte
@@ -298,44 +349,6 @@ func BytesToU32Slice(b []byte) []uint32 {
 	hdr.Cap = hdr.Len
 	hdr.Data = uintptr(unsafe.Pointer(&b[0]))
 	return u32s
-}
-
-// U64ToBytes converts the given Uint64 to bytes
-func U64ToBytes(v uint64) []byte {
-	var uBuf [8]byte
-	binary.BigEndian.PutUint64(uBuf[:], v)
-	return uBuf[:]
-}
-
-// BytesToU64 converts the given byte slice to uint64
-func BytesToU64(b []byte) uint64 {
-	return binary.BigEndian.Uint64(b)
-}
-
-// U64SliceToBytes converts the given Uint64 slice to byte slice
-func U64SliceToBytes(u64s []uint64) []byte {
-	if len(u64s) == 0 {
-		return nil
-	}
-	var b []byte
-	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&b))
-	hdr.Len = len(u64s) * 8
-	hdr.Cap = hdr.Len
-	hdr.Data = uintptr(unsafe.Pointer(&u64s[0]))
-	return b
-}
-
-// BytesToU64Slice converts the given byte slice to uint64 slice
-func BytesToU64Slice(b []byte) []uint64 {
-	if len(b) == 0 {
-		return nil
-	}
-	var u64s []uint64
-	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&u64s))
-	hdr.Len = len(b) / 8
-	hdr.Cap = hdr.Len
-	hdr.Data = uintptr(unsafe.Pointer(&b[0]))
-	return u64s
 }
 
 // page struct contains one underlying buffer.
@@ -500,88 +513,9 @@ func (r *PageBufferReader) Read(p []byte) (int, error) {
 		}
 	}
 
-	if read == 0 && len(p) > 0 {
+	if read == 0 {
 		return read, io.EOF
 	}
 
 	return read, nil
-}
-
-const kvsz = int(unsafe.Sizeof(pb.KV{}))
-
-func NewKV(alloc *z.Allocator) *pb.KV {
-	if alloc == nil {
-		return &pb.KV{}
-	}
-	b := alloc.AllocateAligned(kvsz)
-	return (*pb.KV)(unsafe.Pointer(&b[0]))
-}
-
-// IBytesToString converts size in bytes to human readable format.
-// The code is taken from humanize library and changed to provide
-// value upto custom decimal precision.
-// IBytesToString(12312412, 1) -> 11.7 MiB
-func IBytesToString(size uint64, precision int) string {
-	sizes := []string{"B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
-	base := float64(1024)
-	if size < 10 {
-		return fmt.Sprintf("%d B", size)
-	}
-	e := math.Floor(math.Log(float64(size)) / math.Log(base))
-	suffix := sizes[int(e)]
-	val := float64(size) / math.Pow(base, e)
-	f := "%." + strconv.Itoa(precision) + "f %s"
-
-	return fmt.Sprintf(f, val, suffix)
-}
-
-type RateMonitor struct {
-	start       time.Time
-	lastSent    uint64
-	lastCapture time.Time
-	rates       []float64
-	idx         int
-}
-
-func NewRateMonitor(numSamples int) *RateMonitor {
-	return &RateMonitor{
-		start: time.Now(),
-		rates: make([]float64, numSamples),
-	}
-}
-
-const minRate = 0.0001
-
-// Capture captures the current number of sent bytes. This number should be monotonically
-// increasing.
-func (rm *RateMonitor) Capture(sent uint64) {
-	diff := sent - rm.lastSent
-	dur := time.Since(rm.lastCapture)
-	rm.lastCapture, rm.lastSent = time.Now(), sent
-
-	rate := float64(diff) / dur.Seconds()
-	if rate < minRate {
-		rate = minRate
-	}
-	rm.rates[rm.idx] = rate
-	rm.idx = (rm.idx + 1) % len(rm.rates)
-}
-
-// Rate returns the average rate of transmission smoothed out by the number of samples.
-func (rm *RateMonitor) Rate() uint64 {
-	var total float64
-	var den float64
-	for _, r := range rm.rates {
-		if r < minRate {
-			// Ignore this. We always set minRate, so this is a zero.
-			// Typically at the start of the rate monitor, we'd have zeros.
-			continue
-		}
-		total += r
-		den += 1.0
-	}
-	if den < minRate {
-		return 0
-	}
-	return uint64(total / den)
 }

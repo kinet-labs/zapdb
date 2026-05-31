@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package skl
@@ -17,7 +28,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/kinet-labs/zapdb/y"
+	"github.com/dgraph-io/badger/v2/y"
 )
 
 const arenaSize = 1 << 20
@@ -198,7 +209,7 @@ func TestOneKey(t *testing.T) {
 		}(i)
 	}
 	// We expect that at least some write made it such that some read returns a value.
-	var sawValue atomic.Int32
+	var sawValue int32
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
@@ -207,14 +218,14 @@ func TestOneKey(t *testing.T) {
 			if p.Value == nil {
 				return
 			}
-			sawValue.Add(1)
+			atomic.AddInt32(&sawValue, 1)
 			v, err := strconv.Atoi(string(p.Value))
 			require.NoError(t, err)
 			require.True(t, 0 <= v && v < n, fmt.Sprintf("invalid value %d", v))
 		}()
 	}
 	wg.Wait()
-	require.True(t, sawValue.Load() > 0)
+	require.True(t, sawValue > 0)
 	require.EqualValues(t, 1, length(l))
 }
 

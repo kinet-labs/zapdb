@@ -1,32 +1,41 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2019 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package cmd
 
 import (
+	"io/ioutil"
 	"math/rand"
 	"os"
 	"testing"
 
+	"github.com/dgraph-io/badger/v2"
+	"github.com/dgraph-io/badger/v2/y"
 	"github.com/stretchr/testify/require"
-
-	"github.com/kinet-labs/zapdb"
-	"github.com/kinet-labs/zapdb/y"
 )
 
 func TestRotate(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
-
 	// Creating sample key.
 	key := make([]byte, 32)
 	_, err = rand.Read(key)
 	require.NoError(t, err)
-
-	fp, err := os.CreateTemp("", "*.key")
+	fp, err := ioutil.TempFile("", "*.key")
 	require.NoError(t, err)
 	_, err = fp.Write(key)
 	require.NoError(t, err)
@@ -35,8 +44,6 @@ func TestRotate(t *testing.T) {
 	// Opening DB with the encryption key.
 	opts := badger.DefaultOptions(dir)
 	opts.EncryptionKey = key
-	opts.BlockCacheSize = 1 << 20
-
 	db, err := badger.Open(opts)
 	require.NoError(t, err)
 	// Closing the db.
@@ -52,7 +59,7 @@ func TestRotate(t *testing.T) {
 	key2 := make([]byte, 32)
 	_, err = rand.Read(key2)
 	require.NoError(t, err)
-	fp2, err := os.CreateTemp("", "*.key")
+	fp2, err := ioutil.TempFile("", "*.key")
 	require.NoError(t, err)
 	_, err = fp2.Write(key2)
 	require.NoError(t, err)
@@ -87,7 +94,7 @@ func TestRotate(t *testing.T) {
 
 // This test shows that rotate tool can be used to enable encryption.
 func TestRotatePlainTextToEncrypted(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
@@ -96,16 +103,16 @@ func TestRotatePlainTextToEncrypted(t *testing.T) {
 	db, err := badger.Open(opts)
 	require.NoError(t, err)
 
-	require.NoError(t, db.Update(func(txn *badger.Txn) error {
+	db.Update(func(txn *badger.Txn) error {
 		return txn.Set([]byte("foo"), []byte("bar"))
-	}))
+	})
 
 	require.NoError(t, db.Close())
 
 	// Create an encryption key.
 	key := make([]byte, 32)
 	y.Check2(rand.Read(key))
-	fp, err := os.CreateTemp("", "*.key")
+	fp, err := ioutil.TempFile("", "*.key")
 	require.NoError(t, err)
 	_, err = fp.Write(key)
 	require.NoError(t, err)
@@ -119,7 +126,6 @@ func TestRotatePlainTextToEncrypted(t *testing.T) {
 	require.Nil(t, doRotate(nil, []string{}))
 
 	// Try opening DB without the key.
-	opts.BlockCacheSize = 1 << 20
 	_, err = badger.Open(opts)
 	require.EqualError(t, err, badger.ErrEncryptionKeyMismatch.Error())
 
@@ -128,7 +134,7 @@ func TestRotatePlainTextToEncrypted(t *testing.T) {
 	db, err = badger.Open(opts)
 	require.NoError(t, err)
 
-	require.NoError(t, db.View(func(txn *badger.Txn) error {
+	db.View(func(txn *badger.Txn) error {
 		iopt := badger.DefaultIteratorOptions
 		it := txn.NewIterator(iopt)
 		defer it.Close()
@@ -138,6 +144,6 @@ func TestRotatePlainTextToEncrypted(t *testing.T) {
 		}
 		require.Equal(t, 1, count)
 		return nil
-	}))
+	})
 	require.NoError(t, db.Close())
 }

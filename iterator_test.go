@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2018 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
@@ -8,18 +19,17 @@ package badger
 import (
 	"bytes"
 	"fmt"
-	"math"
+	"io/ioutil"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/dgraph-io/badger/v2/options"
+	"github.com/dgraph-io/badger/v2/table"
+	"github.com/dgraph-io/badger/v2/y"
 	"github.com/stretchr/testify/require"
-
-	"github.com/kinet-labs/zapdb/options"
-	"github.com/kinet-labs/zapdb/table"
-	"github.com/kinet-labs/zapdb/y"
 )
 
 type tableMock struct {
@@ -28,8 +38,7 @@ type tableMock struct {
 
 func (tm *tableMock) Smallest() []byte             { return tm.left }
 func (tm *tableMock) Biggest() []byte              { return tm.right }
-func (tm *tableMock) DoesNotHave(hash uint32) bool { return false }
-func (tm *tableMock) MaxVersion() uint64           { return math.MaxUint64 }
+func (tm *tableMock) DoesNotHave(hash uint64) bool { return false }
 
 func TestPickTables(t *testing.T) {
 	opt := DefaultIteratorOptions
@@ -70,10 +79,11 @@ func TestPickSortTables(t *testing.T) {
 	genTables := func(mks ...MockKeys) []*table.Table {
 		out := make([]*table.Table, 0)
 		for _, mk := range mks {
-			opts := table.Options{ChkMode: options.OnTableAndBlockRead}
-			tbl := buildTable(t, [][]string{{mk.small, "some value"},
-				{mk.large, "some value"}}, opts)
-			defer func() { require.NoError(t, tbl.DecrRef()) }()
+			opts := table.Options{LoadingMode: options.MemoryMap,
+				ChkMode: options.OnTableAndBlockRead}
+			f := buildTable(t, [][]string{{mk.small, "some value"}, {mk.large, "some value"}}, opts)
+			tbl, err := table.OpenTable(f, opts)
+			require.NoError(t, err)
 			out = append(out, tbl)
 		}
 		return out
@@ -114,65 +124,7 @@ func TestPickSortTables(t *testing.T) {
 	require.Equal(t, y.ParseKey(filtered[0].Biggest()), []byte("abc"))
 }
 
-func TestIterateSinceTs(t *testing.T) {
-	bkey := func(i int) []byte {
-		return []byte(fmt.Sprintf("%04d", i))
-	}
-	val := []byte("OK")
-	n := 100000
-
-	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
-		batch := db.NewWriteBatch()
-		for i := 0; i < n; i++ {
-			if (i % 10000) == 0 {
-				t.Logf("Put i=%d\n", i)
-			}
-			require.NoError(t, batch.Set(bkey(i), val))
-		}
-		require.NoError(t, batch.Flush())
-
-		maxVs := db.MaxVersion()
-		sinceTs := maxVs - maxVs/10
-		iopt := DefaultIteratorOptions
-		iopt.SinceTs = sinceTs
-
-		require.NoError(t, db.View(func(txn *Txn) error {
-			it := txn.NewIterator(iopt)
-			defer it.Close()
-
-			for it.Rewind(); it.Valid(); it.Next() {
-				i := it.Item()
-				require.GreaterOrEqual(t, i.Version(), sinceTs)
-			}
-			return nil
-		}))
-
-	})
-}
-
-func TestIterateSinceTsWithPendingWrites(t *testing.T) {
-	// The pending entries still have version=0. Even IteratorOptions.SinceTs is 0, the entries
-	// should be visible.
-	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
-		txn := db.NewTransaction(true)
-		defer txn.Discard()
-		require.NoError(t, txn.Set([]byte("key1"), []byte("value1")))
-		require.NoError(t, txn.Set([]byte("key2"), []byte("value2")))
-		itr := txn.NewIterator(DefaultIteratorOptions)
-		defer itr.Close()
-		count := 0
-		for itr.Rewind(); itr.Valid(); itr.Next() {
-			count++
-		}
-		require.Equal(t, 2, count)
-	})
-}
-
 func TestIteratePrefix(t *testing.T) {
-	if !*manual {
-		t.Skip("Skipping test meant to be run manually.")
-		return
-	}
 	testIteratorPrefix := func(t *testing.T, db *DB) {
 		bkey := func(i int) []byte {
 			return []byte(fmt.Sprintf("%04d", i))
@@ -249,62 +201,39 @@ func TestIteratePrefix(t *testing.T) {
 	}
 
 	t.Run("With Default options", func(t *testing.T) {
+		t.Parallel()
 		runBadgerTest(t, nil, func(t *testing.T, db *DB) {
 			testIteratorPrefix(t, db)
 		})
 	})
 
 	t.Run("With Block Offsets in Cache", func(t *testing.T) {
+		t.Parallel()
 		opts := getTestOptions("")
-		opts.IndexCacheSize = 100 << 20
+		opts = opts.WithKeepBlockIndicesInCache(true)
 		runBadgerTest(t, &opts, func(t *testing.T, db *DB) {
 			testIteratorPrefix(t, db)
 		})
 	})
 
 	t.Run("With Block Offsets and Blocks in Cache", func(t *testing.T) {
+		t.Parallel()
 		opts := getTestOptions("")
-		opts.BlockCacheSize = 100 << 20
-		opts.IndexCacheSize = 100 << 20
+		opts = opts.WithKeepBlockIndicesInCache(true).WithKeepBlocksInCache(true)
 		runBadgerTest(t, &opts, func(t *testing.T, db *DB) {
 			testIteratorPrefix(t, db)
 		})
 	})
 
 	t.Run("With Blocks in Cache", func(t *testing.T) {
+		t.Parallel()
 		opts := getTestOptions("")
-		opts.BlockCacheSize = 100 << 20
+		opts = opts.WithKeepBlocksInCache(true)
 		runBadgerTest(t, &opts, func(t *testing.T, db *DB) {
 			testIteratorPrefix(t, db)
 		})
 	})
 
-}
-
-// Sanity test to verify the iterator does not crash the db in readonly mode if data does not exist.
-func TestIteratorReadOnlyWithNoData(t *testing.T) {
-	dir, err := os.MkdirTemp(".", "badger-test")
-	y.Check(err)
-	defer removeDir(dir)
-	opts := getTestOptions(dir)
-	db, err := Open(opts)
-	require.NoError(t, err)
-	require.NoError(t, db.Close())
-
-	opts.ReadOnly = true
-	db, err = Open(opts)
-	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, db.Close())
-	}()
-
-	require.NoError(t, db.View(func(txn *Txn) error {
-		iopts := DefaultIteratorOptions
-		iopts.Prefix = []byte("xxx")
-		itr := txn.NewIterator(iopts)
-		defer itr.Close()
-		return nil
-	}))
 }
 
 // go test -v -run=XXX -bench=BenchmarkIterate -benchtime=3s
@@ -314,16 +243,12 @@ func TestIteratorReadOnlyWithNoData(t *testing.T) {
 // pkg: github.com/dgraph-io/badger
 // BenchmarkIteratePrefixSingleKey/Key_lookups-4         	   10000	    365539 ns/op
 // --- BENCH: BenchmarkIteratePrefixSingleKey/Key_lookups-4
-//
-//	iterator_test.go:147: Inner b.N: 1
-//	iterator_test.go:147: Inner b.N: 100
-//	iterator_test.go:147: Inner b.N: 10000
-//
+// 	iterator_test.go:147: Inner b.N: 1
+// 	iterator_test.go:147: Inner b.N: 100
+// 	iterator_test.go:147: Inner b.N: 10000
 // --- BENCH: BenchmarkIteratePrefixSingleKey
-//
-//	iterator_test.go:143: LSM files: 79
-//	iterator_test.go:145: Outer b.N: 1
-//
+// 	iterator_test.go:143: LSM files: 79
+// 	iterator_test.go:145: Outer b.N: 1
 // PASS
 // ok  	github.com/dgraph-io/badger	41.586s
 //
@@ -333,25 +258,22 @@ func TestIteratorReadOnlyWithNoData(t *testing.T) {
 // pkg: github.com/dgraph-io/badger
 // BenchmarkIteratePrefixSingleKey/Key_lookups-4         	   10000	    460924 ns/op
 // --- BENCH: BenchmarkIteratePrefixSingleKey/Key_lookups-4
-//
-//	iterator_test.go:147: Inner b.N: 1
-//	iterator_test.go:147: Inner b.N: 100
-//	iterator_test.go:147: Inner b.N: 10000
-//
+// 	iterator_test.go:147: Inner b.N: 1
+// 	iterator_test.go:147: Inner b.N: 100
+// 	iterator_test.go:147: Inner b.N: 10000
 // --- BENCH: BenchmarkIteratePrefixSingleKey
-//
-//	iterator_test.go:143: LSM files: 83
-//	iterator_test.go:145: Outer b.N: 1
-//
+// 	iterator_test.go:143: LSM files: 83
+// 	iterator_test.go:145: Outer b.N: 1
 // PASS
 // ok  	github.com/dgraph-io/badger	41.836s
 //
 // Only my laptop there's a 20% improvement in latency with ~80 files.
 func BenchmarkIteratePrefixSingleKey(b *testing.B) {
-	dir, err := os.MkdirTemp(".", "badger-test")
+	dir, err := ioutil.TempDir(".", "badger-test")
 	y.Check(err)
 	defer removeDir(dir)
 	opts := getTestOptions(dir)
+	opts.TableLoadingMode = options.LoadToRAM
 	db, err := Open(opts)
 	y.Check(err)
 	defer db.Close()
@@ -379,8 +301,8 @@ func BenchmarkIteratePrefixSingleKey(b *testing.B) {
 	})
 	y.Check(err)
 	b.Logf("LSM files: %d", lsmFiles)
-	b.Logf("Key splits: %v", db.Ranges(nil, 10000))
-	b.Logf("Key splits with prefix: %v", db.Ranges([]byte("09"), 10000))
+	b.Logf("Key splits: %v", db.KeySplits(nil))
+	b.Logf("Key splits with prefix: %v", db.KeySplits([]byte("09")))
 
 	b.Logf("Outer b.N: %d", b.N)
 	b.Run("Key lookups", func(b *testing.B) {

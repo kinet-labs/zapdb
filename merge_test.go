@@ -1,13 +1,24 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+* Copyright 2019 Dgraph Labs, Inc. and Contributors
+*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+*     http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
  */
 
 package badger
 
 import (
 	"encoding/binary"
-	"os"
+	"io/ioutil"
 	"testing"
 	"time"
 
@@ -31,9 +42,12 @@ func TestGetMergeOperator(t *testing.T) {
 			m := db.GetMergeOperator(key, add, 200*time.Millisecond)
 			defer m.Stop()
 
-			require.NoError(t, m.Add(uint64ToBytes(1)))
-			require.NoError(t, m.Add(uint64ToBytes(2)))
-			require.NoError(t, m.Add(uint64ToBytes(3)))
+			err := m.Add(uint64ToBytes(1))
+			require.NoError(t, err)
+			m.Add(uint64ToBytes(2))
+			require.NoError(t, err)
+			m.Add(uint64ToBytes(3))
+			require.NoError(t, err)
 
 			res, err := m.Get()
 			require.NoError(t, err)
@@ -50,12 +64,12 @@ func TestGetMergeOperator(t *testing.T) {
 			m := db.GetMergeOperator([]byte("fooprefix"), add, 2*time.Millisecond)
 			defer m.Stop()
 
-			require.NoError(t, m.Add([]byte("A")))
-			require.NoError(t, m.Add([]byte("B")))
-			require.NoError(t, m.Add([]byte("C")))
+			require.Nil(t, m.Add([]byte("A")))
+			require.Nil(t, m.Add([]byte("B")))
+			require.Nil(t, m.Add([]byte("C")))
 
 			value, err := m.Get()
-			require.NoError(t, err)
+			require.Nil(t, err)
 			require.Equal(t, "ABC", string(value))
 		})
 	})
@@ -65,41 +79,16 @@ func TestGetMergeOperator(t *testing.T) {
 			m := db.GetMergeOperator(key, add, 500*time.Millisecond)
 			defer m.Stop()
 
-			require.NoError(t, m.Add(uint64ToBytes(1)))
-			require.NoError(t, m.Add(uint64ToBytes(2)))
-			require.NoError(t, m.Add(uint64ToBytes(3)))
+			err := m.Add(uint64ToBytes(1))
+			require.NoError(t, err)
+			m.Add(uint64ToBytes(2))
+			require.NoError(t, err)
+			m.Add(uint64ToBytes(3))
+			require.NoError(t, err)
 
 			res, err := m.Get()
 			require.NoError(t, err)
 			require.Equal(t, uint64(6), bytesToUint64(res))
-		})
-	})
-
-	t.Run("Get after Delete", func(t *testing.T) {
-		key := []byte("merge")
-		runBadgerTest(t, nil, func(t *testing.T, db *DB) {
-			m := db.GetMergeOperator(key, add, 200*time.Millisecond)
-
-			require.NoError(t, m.Add(uint64ToBytes(1)))
-			require.NoError(t, m.Add(uint64ToBytes(2)))
-			require.NoError(t, m.Add(uint64ToBytes(3)))
-
-			m.Stop()
-			res, err := m.Get()
-			require.NoError(t, err)
-			require.Equal(t, uint64(6), bytesToUint64(res))
-
-			require.NoError(t, db.Update(func(txn *Txn) error {
-				return txn.Delete(key)
-			}))
-
-			m = db.GetMergeOperator(key, add, 200*time.Millisecond)
-			require.NoError(t, m.Add(uint64ToBytes(1)))
-			m.Stop()
-
-			res, err = m.Get()
-			require.NoError(t, err)
-			require.Equal(t, uint64(1), bytesToUint64(res))
 		})
 	})
 
@@ -108,9 +97,12 @@ func TestGetMergeOperator(t *testing.T) {
 		runBadgerTest(t, nil, func(t *testing.T, db *DB) {
 			m := db.GetMergeOperator(key, add, 1*time.Second)
 
-			require.NoError(t, m.Add(uint64ToBytes(1)))
-			require.NoError(t, m.Add(uint64ToBytes(2)))
-			require.NoError(t, m.Add(uint64ToBytes(3)))
+			err := m.Add(uint64ToBytes(1))
+			require.NoError(t, err)
+			m.Add(uint64ToBytes(2))
+			require.NoError(t, err)
+			m.Add(uint64ToBytes(3))
+			require.NoError(t, err)
 
 			m.Stop()
 			res, err := m.Get()
@@ -119,12 +111,11 @@ func TestGetMergeOperator(t *testing.T) {
 		})
 	})
 	t.Run("Old keys should be removed after compaction", func(t *testing.T) {
-		dir, err := os.MkdirTemp("", "badger-test")
+		dir, err := ioutil.TempDir("", "badger-test")
 		require.NoError(t, err)
 		defer removeDir(dir)
 
-		// This test relies on CompactL0OnClose
-		opts := getTestOptions(dir).WithCompactL0OnClose(true)
+		opts := getTestOptions(dir)
 		db, err := Open(opts)
 		require.NoError(t, err)
 		mergeKey := []byte("foo")
@@ -173,6 +164,6 @@ func bytesToUint64(b []byte) uint64 {
 }
 
 // Merge function to add two uint64 numbers
-func add(existing, latest []byte) []byte {
-	return uint64ToBytes(bytesToUint64(existing) + bytesToUint64(latest))
+func add(existing, new []byte) []byte {
+	return uint64ToBytes(bytesToUint64(existing) + bytesToUint64(new))
 }

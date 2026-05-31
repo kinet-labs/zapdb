@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
@@ -8,6 +19,7 @@ package badger
 import (
 	"bytes"
 	"fmt"
+	"io/ioutil"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -16,13 +28,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dgraph-io/badger/v2/pb"
 	"github.com/stretchr/testify/require"
-
-	"github.com/kinet-labs/zapdb/pb"
 )
 
 func TestBackupRestore1(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 	db, err := Open(getTestOptions(dir))
@@ -60,10 +71,10 @@ func TestBackupRestore1(t *testing.T) {
 	require.NoError(t, err)
 
 	// Use different directory.
-	dir, err = os.MkdirTemp("", "badger-test")
+	dir, err = ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
-	bak, err := os.CreateTemp(dir, "badgerbak")
+	bak, err := ioutil.TempFile(dir, "badgerbak")
 	require.NoError(t, err)
 	_, err = db.Backup(bak, 0)
 	require.NoError(t, err)
@@ -91,7 +102,6 @@ func TestBackupRestore1(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			t.Logf("Got entry: %v\n", item.Version())
 			require.Equal(t, entries[count].key, item.Key())
 			require.Equal(t, entries[count].val, val)
 			require.Equal(t, entries[count].version, item.Version())
@@ -102,11 +112,10 @@ func TestBackupRestore1(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
-	require.Equal(t, 3, int(db.orc.nextTs()))
 }
 
 func TestBackupRestore2(t *testing.T) {
-	tmpdir, err := os.MkdirTemp("", "badger-test")
+	tmpdir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 
 	defer removeDir(tmpdir)
@@ -154,9 +163,6 @@ func TestBackupRestore2(t *testing.T) {
 	err = db2.Load(&backup, 16)
 	require.NoError(t, err)
 
-	// Check nextTs is correctly set.
-	require.Equal(t, db1.orc.nextTs(), db2.orc.nextTs())
-
 	for i := byte(1); i < N; i++ {
 		err = db2.View(func(tx *Txn) error {
 			k := append(key1, i)
@@ -203,9 +209,6 @@ func TestBackupRestore2(t *testing.T) {
 
 	err = db3.Load(&backup, 16)
 	require.NoError(t, err)
-
-	// Check nextTs is correctly set.
-	require.Equal(t, db2.orc.nextTs(), db3.orc.nextTs())
 
 	for i := byte(1); i < N; i++ {
 		err = db3.View(func(tx *Txn) error {
@@ -294,7 +297,7 @@ func TestBackup(t *testing.T) {
 		require.NoError(t, err)
 	}
 	t.Run("disk mode", func(t *testing.T) {
-		tmpdir, err := os.MkdirTemp("", "badger-test")
+		tmpdir, err := ioutil.TempDir("", "badger-test")
 		require.NoError(t, err)
 
 		defer removeDir(tmpdir)
@@ -314,7 +317,7 @@ func TestBackup(t *testing.T) {
 
 func TestBackupRestore3(t *testing.T) {
 	var bb bytes.Buffer
-	tmpdir, err := os.MkdirTemp("", "badger-test")
+	tmpdir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 
 	defer removeDir(tmpdir)
@@ -322,7 +325,6 @@ func TestBackupRestore3(t *testing.T) {
 	N := 1000
 	entries := createEntries(N)
 
-	var db1NextTs uint64
 	// backup
 	{
 		db1, err := Open(DefaultOptions(filepath.Join(tmpdir, "backup1")))
@@ -333,8 +335,6 @@ func TestBackupRestore3(t *testing.T) {
 
 		_, err = db1.Backup(&bb, 0)
 		require.NoError(t, err)
-
-		db1NextTs = db1.orc.nextTs()
 		require.NoError(t, db1.Close())
 	}
 	require.True(t, len(entries) == N)
@@ -345,9 +345,7 @@ func TestBackupRestore3(t *testing.T) {
 	require.NoError(t, err)
 
 	defer db2.Close()
-	require.NotEqual(t, db1NextTs, db2.orc.nextTs())
 	require.NoError(t, db2.Load(&bb, 16))
-	require.Equal(t, db1NextTs, db2.orc.nextTs())
 
 	// verify
 	err = db2.View(func(txn *Txn) error {
@@ -375,7 +373,7 @@ func TestBackupRestore3(t *testing.T) {
 }
 
 func TestBackupLoadIncremental(t *testing.T) {
-	tmpdir, err := os.MkdirTemp("", "badger-test")
+	tmpdir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 
 	defer removeDir(tmpdir)
@@ -385,7 +383,6 @@ func TestBackupLoadIncremental(t *testing.T) {
 	updates := make(map[int]byte)
 	var bb bytes.Buffer
 
-	var db1NextTs uint64
 	// backup
 	{
 		db1, err := Open(DefaultOptions(filepath.Join(tmpdir, "backup2")))
@@ -442,9 +439,6 @@ func TestBackupLoadIncremental(t *testing.T) {
 		require.NoError(t, err)
 		_, err = db1.Backup(&bb, since)
 		require.NoError(t, err)
-
-		db1NextTs = db1.orc.nextTs()
-
 		require.NoError(t, db1.Close())
 	}
 	require.True(t, len(entries) == N)
@@ -456,9 +450,7 @@ func TestBackupLoadIncremental(t *testing.T) {
 
 	defer db2.Close()
 
-	require.NotEqual(t, db1NextTs, db2.orc.nextTs())
 	require.NoError(t, db2.Load(&bb, 16))
-	require.Equal(t, db1NextTs, db2.orc.nextTs())
 
 	// verify
 	actual := make(map[int]byte)
@@ -495,7 +487,7 @@ func TestBackupLoadIncremental(t *testing.T) {
 }
 
 func TestBackupBitClear(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 
@@ -506,7 +498,7 @@ func TestBackupBitClear(t *testing.T) {
 
 	key := []byte("foo")
 	val := []byte(fmt.Sprintf("%0100d", 1))
-	require.Greater(t, int64(len(val)), db.valueThreshold())
+	require.Greater(t, len(val), db.opt.ValueThreshold)
 
 	err = db.Update(func(txn *Txn) error {
 		e := NewEntry(key, val)
@@ -516,17 +508,15 @@ func TestBackupBitClear(t *testing.T) {
 	require.NoError(t, err)
 
 	// Use different directory.
-	dir, err = os.MkdirTemp("", "badger-test")
+	dir, err = ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 
-	bak, err := os.CreateTemp(dir, "badgerbak")
+	bak, err := ioutil.TempFile(dir, "badgerbak")
 	require.NoError(t, err)
 	_, err = db.Backup(bak, 0)
 	require.NoError(t, err)
 	require.NoError(t, bak.Close())
-
-	oldValue := db.orc.nextTs()
 	require.NoError(t, db.Close())
 
 	opt = getTestOptions(dir)
@@ -540,8 +530,6 @@ func TestBackupBitClear(t *testing.T) {
 	defer bak.Close()
 
 	require.NoError(t, db.Load(bak, 16))
-	// Ensure nextTs is still the same.
-	require.Equal(t, oldValue, db.orc.nextTs())
 
 	require.NoError(t, db.View(func(txn *Txn) error {
 		e, err := txn.Get(key)

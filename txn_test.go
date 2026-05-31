@@ -1,24 +1,35 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
 
 import (
 	"fmt"
+	"io/ioutil"
 	"math/rand"
-	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
+	"github.com/dgraph-io/badger/v2/options"
+	"github.com/dgraph-io/badger/v2/y"
 
-	"github.com/kinet-labs/zapdb/y"
-	"github.com/dgraph-io/ristretto/v2/z"
+	"github.com/stretchr/testify/require"
 )
 
 func TestTxnSimple(t *testing.T) {
@@ -39,7 +50,7 @@ func TestTxnSimple(t *testing.T) {
 			return nil
 		}))
 
-		require.Panics(t, func() { _ = txn.CommitAt(100, nil) })
+		require.Panics(t, func() { txn.CommitAt(100, nil) })
 		require.NoError(t, txn.Commit())
 	})
 }
@@ -99,7 +110,7 @@ func TestTxnCommitAsync(t *testing.T) {
 		require.NoError(t, txn.Commit())
 		txn.Discard()
 
-		closer := z.NewCloser(1)
+		closer := y.NewCloser(1)
 		go func() {
 			defer closer.Done()
 			for {
@@ -357,7 +368,7 @@ func TestTxnIterationEdgeCase(t *testing.T) {
 
 		// b4 (del)
 		txn = db.NewTransaction(true)
-		require.NoError(t, txn.Delete(kb))
+		txn.Delete(kb)
 		require.NoError(t, txn.Commit())
 		require.Equal(t, uint64(4), db.orc.readTs())
 
@@ -441,7 +452,7 @@ func TestTxnIterationEdgeCase2(t *testing.T) {
 
 		// b4 (del)
 		txn = db.NewTransaction(true)
-		require.NoError(t, txn.Delete(kb))
+		txn.Delete(kb)
 		require.NoError(t, txn.Commit())
 		require.Equal(t, uint64(4), db.orc.readTs())
 
@@ -722,7 +733,7 @@ func TestIteratorAllVersionsWithDeleted2(t *testing.T) {
 }
 
 func TestManagedDB(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 
@@ -739,7 +750,7 @@ func TestManagedDB(t *testing.T) {
 		}
 
 		require.Panics(t, func() {
-			_ = db.Update(func(tx *Txn) error { return nil })
+			db.Update(func(tx *Txn) error { return nil })
 		})
 
 		err = db.View(func(tx *Txn) error { return nil })
@@ -806,16 +817,6 @@ func TestManagedDB(t *testing.T) {
 			}
 		}
 		txn.Discard()
-
-		// Write data to same key, causing a conflict
-		txn = db.NewTransactionAt(10, true)
-		txnb := db.NewTransactionAt(10, true)
-		_, err := txnb.Get(key(0))
-		require.NoError(t, err)
-		require.NoError(t, txn.SetEntry(NewEntry(key(0), val(0))))
-		require.NoError(t, txnb.SetEntry(NewEntry(key(0), val(1))))
-		require.NoError(t, txn.CommitAt(11, nil))
-		require.Equal(t, ErrConflict, txnb.CommitAt(11, nil))
 	}
 	t.Run("disk mode", func(t *testing.T) {
 		db, err := Open(opt)
@@ -836,15 +837,16 @@ func TestManagedDB(t *testing.T) {
 }
 
 func TestArmV7Issue311Fix(t *testing.T) {
-	dir, err := os.MkdirTemp("", "")
+	dir, err := ioutil.TempDir("", "")
 	require.NoError(t, err)
 
 	defer removeDir(dir)
 
 	db, err := Open(DefaultOptions(dir).
+		WithTableLoadingMode(options.MemoryMap).
 		WithValueLogFileSize(16 << 20).
-		WithBaseLevelSize(8 << 20).
-		WithBaseTableSize(2 << 20).
+		WithLevelOneSize(8 << 20).
+		WithMaxTableSize(2 << 20).
 		WithSyncWrites(false))
 
 	require.NoError(t, err)
@@ -870,7 +872,7 @@ func TestArmV7Issue311Fix(t *testing.T) {
 // Regression test for https://github.com/dgraph-io/badger/issues/1289
 func TestConflict(t *testing.T) {
 	key := []byte("foo")
-	var setCount atomic.Uint32
+	setCount := uint32(0)
 
 	testAndSet := func(wg *sync.WaitGroup, db *DB) {
 		defer wg.Done()
@@ -884,7 +886,7 @@ func TestConflict(t *testing.T) {
 			require.NoError(t, txn.Set(key, []byte("AA")))
 			txn.CommitWith(func(err error) {
 				if err == nil {
-					require.LessOrEqual(t, uint32(1), setCount.Add(1))
+					require.LessOrEqual(t, uint32(1), atomic.AddUint32(&setCount, 1))
 				} else {
 
 					require.Error(t, err, ErrConflict)
@@ -911,7 +913,7 @@ func TestConflict(t *testing.T) {
 			require.NoError(t, txn.Set(key, []byte("AA")))
 			txn.CommitWith(func(err error) {
 				if err == nil {
-					require.LessOrEqual(t, setCount.Add(1), uint32(1))
+					require.LessOrEqual(t, atomic.AddUint32(&setCount, 1), uint32(1))
 				} else {
 					require.Error(t, err, ErrConflict)
 				}
@@ -925,14 +927,14 @@ func TestConflict(t *testing.T) {
 		for i := 0; i < loop; i++ {
 			var wg sync.WaitGroup
 			wg.Add(numGo)
-			setCount.Store(0)
+			setCount = 0
 			runBadgerTest(t, nil, func(t *testing.T, db *DB) {
 				for j := 0; j < numGo; j++ {
 					go fn(&wg, db)
 				}
 				wg.Wait()
 			})
-			require.Equal(t, uint32(1), setCount.Load())
+			require.Equal(t, uint32(1), atomic.LoadUint32(&setCount))
 		}
 	}
 	t.Run("TxnGet", func(t *testing.T) {

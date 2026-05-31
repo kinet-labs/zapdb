@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2018 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
@@ -8,17 +19,15 @@ package badger
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"math"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
 
+	bpb "github.com/dgraph-io/badger/v2/pb"
+	"github.com/dgraph-io/badger/v2/y"
 	"github.com/stretchr/testify/require"
-
-	bpb "github.com/kinet-labs/zapdb/pb"
-	"github.com/kinet-labs/zapdb/y"
-	"github.com/dgraph-io/ristretto/v2/z"
 )
 
 func keyWithPrefix(prefix string, k int) []byte {
@@ -40,25 +49,15 @@ type collector struct {
 	kv []*bpb.KV
 }
 
-func (c *collector) Send(buf *z.Buffer) error {
-	list, err := BufferToKVList(buf)
-	if err != nil {
-		return err
-	}
-	for _, kv := range list.Kv {
-		if kv.StreamDone == true {
-			return nil
-		}
-		cp := kv.Clone()
-		c.kv = append(c.kv, cp)
-	}
-	return err
+func (c *collector) Send(list *bpb.KVList) error {
+	c.kv = append(c.kv, list.Kv...)
+	return nil
 }
 
 var ctxb = context.Background()
 
 func TestStream(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 
@@ -159,69 +158,8 @@ func TestStream(t *testing.T) {
 	require.NoError(t, db.Close())
 }
 
-func TestStreamMaxSize(t *testing.T) {
-	if !*manual {
-		t.Skip("Skipping test meant to be run manually.")
-		return
-	}
-	// Set the maxStreamSize to 1MB for the duration of the test so that the it can use a smaller
-	// dataset than it would otherwise need.
-	originalMaxStreamSize := maxStreamSize
-	maxStreamSize = 1 << 20
-	defer func() {
-		maxStreamSize = originalMaxStreamSize
-	}()
-
-	testSize := int(1e6)
-	dir, err := os.MkdirTemp("", "badger-big-test")
-	require.NoError(t, err)
-	defer removeDir(dir)
-
-	db, err := OpenManaged(DefaultOptions(dir))
-	require.NoError(t, err)
-
-	var count int
-	wb := db.NewWriteBatchAt(5)
-	for _, prefix := range []string{"p0", "p1", "p2"} {
-		for i := 1; i <= testSize; i++ {
-			require.NoError(t, wb.SetEntry(NewEntry(keyWithPrefix(prefix, i), value(i))))
-			count++
-		}
-	}
-	require.NoError(t, wb.Flush())
-
-	stream := db.NewStreamAt(math.MaxUint64)
-	stream.LogPrefix = "Testing"
-	c := &collector{}
-	stream.Send = c.Send
-
-	// default value
-	require.Equal(t, stream.MaxSize, maxStreamSize)
-
-	// reset maxsize
-	stream.MaxSize = 1024 * 1024 * 50
-
-	// Test case 1. Retrieve everything.
-	err = stream.Orchestrate(ctxb)
-	require.NoError(t, err)
-	require.Equal(t, 3*testSize, len(c.kv), "Expected 30000. Got: %d", len(c.kv))
-
-	m := make(map[string]int)
-	for _, kv := range c.kv {
-		prefix, ki := keyToInt(kv.Key)
-		expected := value(ki)
-		require.Equal(t, expected, kv.Value)
-		m[prefix]++
-	}
-	require.Equal(t, 3, len(m))
-	for pred, count := range m {
-		require.Equal(t, testSize, count, "Count mismatch for pred: %s", pred)
-	}
-	require.NoError(t, db.Close())
-}
-
 func TestStreamWithThreadId(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 
@@ -267,10 +205,6 @@ func TestStreamWithThreadId(t *testing.T) {
 }
 
 func TestBigStream(t *testing.T) {
-	if !*manual {
-		t.Skip("Skipping test meant to be run manually.")
-		return
-	}
 	// Set the maxStreamSize to 1MB for the duration of the test so that the it can use a smaller
 	// dataset than it would otherwise need.
 	originalMaxStreamSize := maxStreamSize
@@ -280,7 +214,7 @@ func TestBigStream(t *testing.T) {
 	}()
 
 	testSize := int(1e6)
-	dir, err := os.MkdirTemp("", "badger-big-test")
+	dir, err := ioutil.TempDir("", "badger-big-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 
@@ -319,57 +253,4 @@ func TestBigStream(t *testing.T) {
 		require.Equal(t, testSize, count, "Count mismatch for pred: %s", pred)
 	}
 	require.NoError(t, db.Close())
-}
-
-// There was a bug in the stream writer code which would cause allocators to be
-// freed up twice if the default keyToList was not used. This test verifies that issue.
-func TestStreamCustomKeyToList(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
-	require.NoError(t, err)
-	defer removeDir(dir)
-
-	db, err := OpenManaged(DefaultOptions(dir))
-	require.NoError(t, err)
-
-	var count int
-	for _, key := range []string{"p0", "p1", "p2"} {
-		for i := 1; i <= 100; i++ {
-			txn := db.NewTransactionAt(math.MaxUint64, true)
-			require.NoError(t, txn.SetEntry(NewEntry([]byte(key), value(i))))
-			count++
-			require.NoError(t, txn.CommitAt(uint64(i), nil))
-		}
-	}
-
-	stream := db.NewStreamAt(math.MaxUint64)
-	stream.LogPrefix = "Testing"
-	stream.KeyToList = func(key []byte, itr *Iterator) (*bpb.KVList, error) {
-		item := itr.Item()
-		val, err := item.ValueCopy(nil)
-		if err != nil {
-			return nil, err
-		}
-		kv := &bpb.KV{
-			Key:   y.Copy(item.Key()),
-			Value: val,
-		}
-		return &bpb.KVList{
-			Kv: []*bpb.KV{kv},
-		}, nil
-	}
-	res := map[string]struct{}{"p0": {}, "p1": {}, "p2": {}}
-	stream.Send = func(buf *z.Buffer) error {
-		list, err := BufferToKVList(buf)
-		require.NoError(t, err)
-		for _, kv := range list.Kv {
-			key := string(kv.Key)
-			if _, ok := res[key]; !ok {
-				panic(fmt.Sprintf("%s key not found", key))
-			}
-			delete(res, key)
-		}
-		return nil
-	}
-	require.NoError(t, stream.Orchestrate(ctxb))
-	require.Zero(t, len(res))
 }

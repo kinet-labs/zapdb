@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# Run this script from its directory, so that badgerpb4.proto is where it's expected to
-# be.
+# You might need to go get -v github.com/gogo/protobuf/...
 
-go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.31.0
-protoc --go_out=. --go_opt=paths=source_relative badgerpb4.proto
+protos=${GOPATH-$HOME/go}/src/github.com/dgraph-io/badger/pb
+pushd $protos > /dev/null
+protoc --gofast_out=plugins=grpc:. -I=. pb.proto
 
-# Add grpc build tag so protobuf types are only compiled when grpc tag is set.
-# The default (non-grpc) build uses native binary encoding from types_zap.go.
-sed -i.bak '1s/^/\/\/go:build grpc\n\n/' badgerpb4.pb.go && rm -f badgerpb4.pb.go.bak
+# Move pb.pb.go file to the correct directory. This is necessary because protoc
+# would generate the pb.pb.go file inside a different directory.
+mv $protos/github.com/dgraph-io/badger/v2/pb/pb.pb.go ./

@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package y
@@ -35,6 +46,10 @@ func sizeVarint(x uint64) (n int) {
 // EncodedSize is the size of the ValueStruct when encoded
 func (v *ValueStruct) EncodedSize() uint32 {
 	sz := len(v.Value) + 2 // meta, usermeta.
+	if v.ExpiresAt == 0 {
+		return uint32(sz + 1)
+	}
+
 	enc := sizeVarint(v.ExpiresAt)
 	return uint32(sz + enc)
 }
@@ -49,12 +64,11 @@ func (v *ValueStruct) Decode(b []byte) {
 }
 
 // Encode expects a slice of length at least v.EncodedSize().
-func (v *ValueStruct) Encode(b []byte) uint32 {
+func (v *ValueStruct) Encode(b []byte) {
 	b[0] = v.Meta
 	b[1] = v.UserMeta
 	sz := binary.PutUvarint(b[2:], v.ExpiresAt)
-	n := copy(b[2+sz:], v.Value)
-	return uint32(2 + sz + n)
+	copy(b[2+sz:], v.Value)
 }
 
 // EncodeTo should be kept in sync with the Encode function above. The reason
@@ -65,7 +79,6 @@ func (v *ValueStruct) EncodeTo(buf *bytes.Buffer) {
 	buf.WriteByte(v.UserMeta)
 	var enc [binary.MaxVarintLen64]byte
 	sz := binary.PutUvarint(enc[:], v.ExpiresAt)
-
 	buf.Write(enc[:sz])
 	buf.Write(v.Value)
 }

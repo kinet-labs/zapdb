@@ -1,22 +1,26 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
 
 import (
-	"fmt"
-	"os"
-	"reflect"
-	"strconv"
-	"strings"
 	"time"
 
-	"github.com/kinet-labs/zapdb/options"
-	"github.com/kinet-labs/zapdb/table"
-	"github.com/kinet-labs/zapdb/y"
-	"github.com/dgraph-io/ristretto/v2/z"
+	"github.com/dgraph-io/badger/v2/options"
+	"github.com/dgraph-io/badger/v2/table"
 )
 
 // Note: If you add a new option X make sure you also add a WithX method on Options.
@@ -29,8 +33,6 @@ import (
 //
 // Each option X is documented on the WithX method.
 type Options struct {
-	testOnlyOptions
-
 	// Required options.
 
 	Dir      string
@@ -38,44 +40,42 @@ type Options struct {
 
 	// Usually modified options.
 
-	SyncWrites        bool
-	NumVersionsToKeep int
-	ReadOnly          bool
-	Logger            Logger
-	Compression       options.CompressionType
-	InMemory          bool
-	MetricsEnabled    bool
-	// Sets the Stream.numGo field
-	NumGoroutines int
+	SyncWrites          bool
+	TableLoadingMode    options.FileLoadingMode
+	ValueLogLoadingMode options.FileLoadingMode
+	NumVersionsToKeep   int
+	ReadOnly            bool
+	Truncate            bool
+	Logger              Logger
+	Compression         options.CompressionType
+	InMemory            bool
 
 	// Fine tuning options.
 
-	MemTableSize        int64
-	BaseTableSize       int64
-	BaseLevelSize       int64
+	MaxTableSize        int64
 	LevelSizeMultiplier int
-	TableSizeMultiplier int
 	MaxLevels           int
-
-	VLogPercentile float64
-	ValueThreshold int64
-	NumMemtables   int
+	ValueThreshold      int
+	NumMemtables        int
 	// Changing BlockSize across DB runs will not break badger. The block size is
 	// read from the block index stored at the end of the table.
 	BlockSize          int
 	BloomFalsePositive float64
-	BlockCacheSize     int64
-	IndexCacheSize     int64
+	KeepL0InMemory     bool
+	MaxCacheSize       int64
+	MaxBfCacheSize     int64
+	LoadBloomsOnOpen   bool
 
 	NumLevelZeroTables      int
 	NumLevelZeroTablesStall int
 
+	LevelOneSize       int64
 	ValueLogFileSize   int64
 	ValueLogMaxEntries uint32
 
 	NumCompactors        int
 	CompactL0OnClose     bool
-	LmaxCompaction       bool
+	LogRotatesToFlush    int32
 	ZSTDCompressionLevel int
 
 	// When set, checksum will be validated for each entry read from the value log file.
@@ -85,7 +85,7 @@ type Options struct {
 	EncryptionKey                 []byte        // encryption key
 	EncryptionKeyRotationDuration time.Duration // key rotation duration
 
-	// BypassLockGuard will bypass the lock guard on badger. Bypassing lock
+	// BypassLockGaurd will bypass the lock guard on badger. Bypassing lock
 	// guard can cause data corruption if multiple badger instances are using
 	// the same directory. Use this options with caution.
 	BypassLockGuard bool
@@ -98,12 +98,11 @@ type Options struct {
 	// conflict detection is disabled.
 	DetectConflicts bool
 
-	// NamespaceOffset specifies the offset from where the next 8 bytes contains the namespace.
-	NamespaceOffset int
+	// KeepBlockIndicesInCache decides whether to keep the block offsets in the cache or not.
+	KeepBlockIndicesInCache bool
 
-	// Magic version used by the application using badger to ensure that it doesn't open the DB
-	// with incompatible data format.
-	ExternalMagicVersion uint16
+	// KeepBlocksInCache decides whether to keep the sst blocks in the cache or not.
+	KeepBlocksInCache bool
 
 	// Transaction start and commit timestamps are managed by end-user.
 	// This is only useful for databases built on top of Badger (like Dgraph).
@@ -114,45 +113,41 @@ type Options struct {
 	// ------------------------------
 	maxBatchCount int64 // max entries in batch
 	maxBatchSize  int64 // max batch size in bytes
-
-	maxValueThreshold float64
 }
 
 // DefaultOptions sets a list of recommended options for good performance.
 // Feel free to modify these to suit your needs with the WithX methods.
 func DefaultOptions(path string) Options {
 	return Options{
-		Dir:      path,
-		ValueDir: path,
-
-		MemTableSize:        64 << 20,
-		BaseTableSize:       2 << 20,
-		BaseLevelSize:       10 << 20,
-		TableSizeMultiplier: 2,
+		Dir:                 path,
+		ValueDir:            path,
+		LevelOneSize:        256 << 20,
 		LevelSizeMultiplier: 10,
-		MaxLevels:           7,
-		NumGoroutines:       8,
-		MetricsEnabled:      true,
-
-		NumCompactors:           4, // Run at least 2 compactors. Zero-th compactor prioritizes L0.
+		TableLoadingMode:    options.MemoryMap,
+		ValueLogLoadingMode: options.MemoryMap,
+		// table.MemoryMap to mmap() the tables.
+		// table.Nothing to not preload the tables.
+		MaxLevels:               7,
+		MaxTableSize:            64 << 20,
+		NumCompactors:           2, // Compactions can be expensive. Only run 2.
 		NumLevelZeroTables:      5,
-		NumLevelZeroTablesStall: 15,
+		NumLevelZeroTablesStall: 10,
 		NumMemtables:            5,
 		BloomFalsePositive:      0.01,
 		BlockSize:               4 * 1024,
-		SyncWrites:              false,
+		SyncWrites:              true,
 		NumVersionsToKeep:       1,
-		CompactL0OnClose:        false,
+		CompactL0OnClose:        true,
+		KeepL0InMemory:          false,
 		VerifyValueChecksum:     false,
-		Compression:             options.Snappy,
-		BlockCacheSize:          256 << 20,
-		IndexCacheSize:          0,
-
+		Compression:             options.None,
+		MaxCacheSize:            0,
+		MaxBfCacheSize:          0,
+		LoadBloomsOnOpen:        true,
 		// The following benchmarks were done on a 4 KB block size (default block size). The
 		// compression is ratio supposed to increase with increasing compression level but since the
 		// input for compression algorithm is small (4 KB), we don't get significant benefit at
 		// level 3.
-		// NOTE: The benchmarks are with DataDog ZSTD that requires CGO. Hence, no longer valid.
 		// no_compression-16              10	 502848865 ns/op	 165.46 MB/s	-
 		// zstd_compression/level_1-16     7	 739037966 ns/op	 112.58 MB/s	2.93
 		// zstd_compression/level_3-16     7	 756950250 ns/op	 109.91 MB/s	2.72
@@ -160,40 +155,36 @@ func DefaultOptions(path string) Options {
 		// Benchmark code can be found in table/builder_test.go file
 		ZSTDCompressionLevel: 1,
 
+		// Nothing to read/write value log using standard File I/O
+		// MemoryMap to mmap() the value log files
 		// (2^30 - 1)*2 when mmapping < 2^31 - 1, max int32.
 		// -1 so 2*ValueLogFileSize won't overflow on 32-bit systems.
 		ValueLogFileSize: 1<<30 - 1,
 
-		ValueLogMaxEntries: 1000000,
-
-		VLogPercentile: 0.0,
-		ValueThreshold: maxValueThreshold,
-
+		ValueLogMaxEntries:            1000000,
+		ValueThreshold:                1 << 10, // 1 KB.
+		Truncate:                      false,
 		Logger:                        defaultLogger(INFO),
+		LogRotatesToFlush:             2,
 		EncryptionKey:                 []byte{},
 		EncryptionKeyRotationDuration: 10 * 24 * time.Hour, // Default 10 days.
 		DetectConflicts:               true,
-		NamespaceOffset:               -1,
+		KeepBlocksInCache:             false,
+		KeepBlockIndicesInCache:       false,
 	}
 }
 
-func buildTableOptions(db *DB) table.Options {
-	opt := db.opt
-	dk, err := db.registry.LatestDataKey()
-	y.Check(err)
+func buildTableOptions(opt Options) table.Options {
 	return table.Options{
-		ReadOnly:             opt.ReadOnly,
-		MetricsEnabled:       db.opt.MetricsEnabled,
-		TableSize:            uint64(opt.BaseTableSize),
-		BlockSize:            opt.BlockSize,
-		BloomFalsePositive:   opt.BloomFalsePositive,
-		ChkMode:              opt.ChecksumVerificationMode,
-		Compression:          opt.Compression,
-		ZSTDCompressionLevel: opt.ZSTDCompressionLevel,
-		BlockCache:           db.blockCache,
-		IndexCache:           db.indexCache,
-		AllocPool:            db.allocPool,
-		DataKey:              dk,
+		BlockSize:               opt.BlockSize,
+		BloomFalsePositive:      opt.BloomFalsePositive,
+		LoadBloomsOnOpen:        opt.LoadBloomsOnOpen,
+		LoadingMode:             opt.TableLoadingMode,
+		ChkMode:                 opt.ChecksumVerificationMode,
+		Compression:             opt.Compression,
+		ZSTDCompressionLevel:    opt.ZSTDCompressionLevel,
+		KeepBlockIndicesInCache: opt.KeepBlockIndicesInCache,
+		KeepBlocksInCache:       opt.KeepBlocksInCache,
 	}
 }
 
@@ -219,134 +210,6 @@ func LSMOnlyOptions(path string) Options {
 	return DefaultOptions(path).WithValueThreshold(maxValueThreshold /* 1 MB */)
 }
 
-// parseCompression returns badger.compressionType and compression level given compression string
-// of format compression-type:compression-level
-func parseCompression(cStr string) (options.CompressionType, int, error) {
-	cStrSplit := strings.Split(cStr, ":")
-	cType := cStrSplit[0]
-	level := 3
-
-	var err error
-	if len(cStrSplit) == 2 {
-		level, err = strconv.Atoi(cStrSplit[1])
-		y.Check(err)
-		if level <= 0 {
-			return 0, 0,
-				fmt.Errorf("ERROR: compression level(%v) must be greater than zero", level)
-		}
-	} else if len(cStrSplit) > 2 {
-		return 0, 0, fmt.Errorf("ERROR: Invalid badger.compression argument")
-	}
-	switch cType {
-	case "zstd":
-		return options.ZSTD, level, nil
-	case "snappy":
-		return options.Snappy, 0, nil
-	case "none":
-		return options.None, 0, nil
-	}
-	return 0, 0, fmt.Errorf("ERROR: compression type (%s) invalid", cType)
-}
-
-// generateSuperFlag generates an identical SuperFlag string from the provided Options.
-func generateSuperFlag(options Options) string {
-	superflag := ""
-	v := reflect.ValueOf(&options).Elem()
-	optionsStruct := v.Type()
-	for i := 0; i < v.NumField(); i++ {
-		if field := v.Field(i); field.CanInterface() {
-			name := strings.ToLower(optionsStruct.Field(i).Name)
-			kind := v.Field(i).Kind()
-			switch kind {
-			case reflect.Bool:
-				superflag += name + "="
-				superflag += fmt.Sprintf("%v; ", field.Bool())
-			case reflect.Int, reflect.Int64:
-				superflag += name + "="
-				superflag += fmt.Sprintf("%v; ", field.Int())
-			case reflect.Uint32, reflect.Uint64:
-				superflag += name + "="
-				superflag += fmt.Sprintf("%v; ", field.Uint())
-			case reflect.Float64:
-				superflag += name + "="
-				superflag += fmt.Sprintf("%v; ", field.Float())
-			case reflect.String:
-				superflag += name + "="
-				superflag += fmt.Sprintf("%v; ", field.String())
-			default:
-				continue
-			}
-		}
-	}
-	return superflag
-}
-
-// FromSuperFlag fills Options fields for each flag within the superflag. For
-// example, replacing the default Options.NumGoroutines:
-//
-//	options := FromSuperFlag("numgoroutines=4", DefaultOptions(""))
-//
-// It's important to note that if you pass an empty Options struct, FromSuperFlag
-// will not fill it with default values. FromSuperFlag only writes to the fields
-// present within the superflag string (case insensitive).
-//
-// It specially handles compression subflag.
-// Valid options are {none,snappy,zstd:<level>}
-// Example: compression=zstd:3;
-// Unsupported: Options.Logger, Options.EncryptionKey
-func (opt Options) FromSuperFlag(superflag string) Options {
-	// currentOptions act as a default value for the options superflag.
-	currentOptions := generateSuperFlag(opt)
-	currentOptions += "compression=;"
-
-	flags := z.NewSuperFlag(superflag).MergeAndCheckDefault(currentOptions)
-	v := reflect.ValueOf(&opt).Elem()
-	optionsStruct := v.Type()
-	for i := 0; i < v.NumField(); i++ {
-		// only iterate over exported fields
-		if field := v.Field(i); field.CanInterface() {
-			// z.SuperFlag stores keys as lowercase, keep everything case
-			// insensitive
-			name := strings.ToLower(optionsStruct.Field(i).Name)
-			if name == "compression" {
-				// We will specially handle this later. Skip it here.
-				continue
-			}
-			kind := v.Field(i).Kind()
-			switch kind {
-			case reflect.Bool:
-				field.SetBool(flags.GetBool(name))
-			case reflect.Int, reflect.Int64:
-				field.SetInt(flags.GetInt64(name))
-			case reflect.Uint32, reflect.Uint64:
-				field.SetUint(flags.GetUint64(name))
-			case reflect.Float64:
-				field.SetFloat(flags.GetFloat64(name))
-			case reflect.String:
-				field.SetString(flags.GetString(name))
-			}
-		}
-	}
-
-	// Only update the options for special flags that were present in the input superflag.
-	inputFlag := z.NewSuperFlag(superflag)
-	if inputFlag.Has("compression") {
-		ctype, clevel, err := parseCompression(flags.GetString("compression"))
-		switch err {
-		case nil:
-			opt.Compression = ctype
-			opt.ZSTDCompressionLevel = clevel
-		default:
-			ctype = options.CompressionType(flags.GetUint32("compression"))
-			y.AssertTruef(ctype <= 2, "ERROR: Invalid format or compression type. Got: %s",
-				flags.GetString("compression"))
-			opt.Compression = ctype
-		}
-	}
-
-	return opt
-}
-
 // WithDir returns a new Options value with Dir set to the given value.
 //
 // Dir is the path of the directory where key data will be stored in.
@@ -367,17 +230,47 @@ func (opt Options) WithValueDir(val string) Options {
 	return opt
 }
 
+// WithLoggingLevel returns a new Options value with logging level of the
+// default logger set to the given value.
+// LoggingLevel sets the level of logging. It should be one of DEBUG, INFO,
+// WARNING or ERROR levels.
+//
+// The default value of LoggingLevel is INFO.
+func (opt Options) WithLoggingLevel(val loggingLevel) Options {
+	opt.Logger = defaultLogger(val)
+	return opt
+}
+
 // WithSyncWrites returns a new Options value with SyncWrites set to the given value.
 //
-// Badger does all writes via mmap. So, all writes can survive process crashes or k8s environments
-// with SyncWrites set to false.
+// When SyncWrites is true all writes are synced to disk. Setting this to false would achieve better
+// performance, but may cause data loss in case of crash.
 //
-// When set to true, Badger would call an additional msync after writes to flush mmap buffer over to
-// disk to survive hard reboots. Most users of Badger should not need to do this.
-//
-// The default value of SyncWrites is false.
+// The default value of SyncWrites is true.
 func (opt Options) WithSyncWrites(val bool) Options {
 	opt.SyncWrites = val
+	return opt
+}
+
+// WithTableLoadingMode returns a new Options value with TableLoadingMode set to the given value.
+//
+// TableLoadingMode indicates which file loading mode should be used for the LSM tree data files.
+//
+// The default value of TableLoadingMode is options.MemoryMap.
+func (opt Options) WithTableLoadingMode(val options.FileLoadingMode) Options {
+	opt.TableLoadingMode = val
+	return opt
+}
+
+// WithValueLogLoadingMode returns a new Options value with ValueLogLoadingMode set to the given
+// value.
+//
+// ValueLogLoadingMode indicates which file loading mode should be used for the value log data
+// files.
+//
+// The default value of ValueLogLoadingMode is options.MemoryMap.
+func (opt Options) WithValueLogLoadingMode(val options.FileLoadingMode) Options {
+	opt.ValueLogLoadingMode = val
 	return opt
 }
 
@@ -388,14 +281,6 @@ func (opt Options) WithSyncWrites(val bool) Options {
 // The default value of NumVersionsToKeep is 1.
 func (opt Options) WithNumVersionsToKeep(val int) Options {
 	opt.NumVersionsToKeep = val
-	return opt
-}
-
-// WithNumGoroutines sets the number of goroutines to be used in Stream.
-//
-// The default value of NumGoroutines is 8.
-func (opt Options) WithNumGoroutines(val int) Options {
-	opt.NumGoroutines = val
 	return opt
 }
 
@@ -412,18 +297,14 @@ func (opt Options) WithReadOnly(val bool) Options {
 	return opt
 }
 
-// WithMetricsEnabled returns a new Options value with MetricsEnabled set to the given value.
+// WithTruncate returns a new Options value with Truncate set to the given value.
 //
-// When MetricsEnabled is set to false, then the DB will be opened and no badger metrics
-// will be logged. Metrics are defined in metric.go file.
+// Truncate indicates whether value log files should be truncated to delete corrupt data, if any.
+// This option is ignored when ReadOnly is true.
 //
-// This flag is useful for use cases like in Dgraph where we open temporary badger instances to
-// index data. In those cases we don't want badger metrics to be polluted with the noise from
-// those temporary instances.
-//
-// Default value is set to true
-func (opt Options) WithMetricsEnabled(val bool) Options {
-	opt.MetricsEnabled = val
+// The default value of Truncate is false.
+func (opt Options) WithTruncate(val bool) Options {
+	opt.Truncate = val
 	return opt
 }
 
@@ -437,24 +318,13 @@ func (opt Options) WithLogger(val Logger) Options {
 	return opt
 }
 
-// WithLoggingLevel returns a new Options value with logging level of the
-// default logger set to the given value.
-// LoggingLevel sets the level of logging. It should be one of DEBUG, INFO,
-// WARNING or ERROR levels.
+// WithMaxTableSize returns a new Options value with MaxTableSize set to the given value.
 //
-// The default value of LoggingLevel is INFO.
-func (opt Options) WithLoggingLevel(val loggingLevel) Options {
-	opt.Logger = defaultLogger(val)
-	return opt
-}
-
-// WithBaseTableSize returns a new Options value with BaseTableSize set to the given value.
+// MaxTableSize sets the maximum size in bytes for each LSM table or file.
 //
-// BaseTableSize sets the maximum size in bytes for LSM table or file in the base level.
-//
-// The default value of BaseTableSize is 2MB.
-func (opt Options) WithBaseTableSize(val int64) Options {
-	opt.BaseTableSize = val
+// The default value of MaxTableSize is 64MB.
+func (opt Options) WithMaxTableSize(val int64) Options {
+	opt.MaxTableSize = val
 	return opt
 }
 
@@ -463,7 +333,7 @@ func (opt Options) WithBaseTableSize(val int64) Options {
 //
 // LevelSizeMultiplier sets the ratio between the maximum sizes of contiguous levels in the LSM.
 // Once a level grows to be larger than this ratio allowed, the compaction process will be
-// triggered.
+//  triggered.
 //
 // The default value of LevelSizeMultiplier is 10.
 func (opt Options) WithLevelSizeMultiplier(val int) Options {
@@ -486,27 +356,9 @@ func (opt Options) WithMaxLevels(val int) Options {
 // ValueThreshold sets the threshold used to decide whether a value is stored directly in the LSM
 // tree or separately in the log value files.
 //
-// The default value of ValueThreshold is 1 MB, and LSMOnlyOptions sets it to maxValueThreshold
-// which is set to 1 MB too.
-func (opt Options) WithValueThreshold(val int64) Options {
+// The default value of ValueThreshold is 1 KB, but LSMOnlyOptions sets it to maxValueThreshold.
+func (opt Options) WithValueThreshold(val int) Options {
 	opt.ValueThreshold = val
-	return opt
-}
-
-// WithVLogPercentile returns a new Options value with ValLogPercentile set to given value.
-//
-// VLogPercentile with 0.0 means no dynamic thresholding is enabled.
-// MinThreshold value will always act as the value threshold.
-//
-// VLogPercentile with value 0.99 means 99 percentile of value will be put in LSM tree
-// and only 1 percent in vlog. The value threshold will be dynamically updated within the range of
-// [ValueThreshold, Options.maxValueThreshold]
-//
-// # Say VLogPercentile with 1.0 means threshold will eventually set to Options.maxValueThreshold
-//
-// The default value of VLogPercentile is 0.0.
-func (opt Options) WithVLogPercentile(t float64) Options {
-	opt.VLogPercentile = t
 	return opt
 }
 
@@ -520,16 +372,6 @@ func (opt Options) WithNumMemtables(val int) Options {
 	return opt
 }
 
-// WithMemTableSize returns a new Options value with MemTableSize set to the given value.
-//
-// MemTableSize sets the maximum size in bytes for memtable table.
-//
-// The default value of MemTableSize is 64MB.
-func (opt Options) WithMemTableSize(val int64) Options {
-	opt.MemTableSize = val
-	return opt
-}
-
 // WithBloomFalsePositive returns a new Options value with BloomFalsePositive set
 // to the given value.
 //
@@ -539,8 +381,6 @@ func (opt Options) WithMemTableSize(val int64) Options {
 // consume more memory.
 //
 // The default value of BloomFalsePositive is 0.01.
-//
-// Setting this to 0 disables the bloom filter completely.
 func (opt Options) WithBloomFalsePositive(val float64) Options {
 	opt.BloomFalsePositive = val
 	return opt
@@ -557,7 +397,10 @@ func (opt Options) WithBlockSize(val int) Options {
 	return opt
 }
 
-// WithNumLevelZeroTables sets the maximum number of Level 0 tables before compaction starts.
+// WithNumLevelZeroTables returns a new Options value with NumLevelZeroTables set to the given
+// value.
+//
+// NumLevelZeroTables sets the maximum number of Level 0 tables before compaction starts.
 //
 // The default value of NumLevelZeroTables is 5.
 func (opt Options) WithNumLevelZeroTables(val int) Options {
@@ -565,24 +408,31 @@ func (opt Options) WithNumLevelZeroTables(val int) Options {
 	return opt
 }
 
-// WithNumLevelZeroTablesStall sets the number of Level 0 tables that once reached causes the DB to
+// WithNumLevelZeroTablesStall returns a new Options value with NumLevelZeroTablesStall set to the
+// given value.
+//
+// NumLevelZeroTablesStall sets the number of Level 0 tables that once reached causes the DB to
 // stall until compaction succeeds.
 //
-// The default value of NumLevelZeroTablesStall is 15.
+// The default value of NumLevelZeroTablesStall is 10.
 func (opt Options) WithNumLevelZeroTablesStall(val int) Options {
 	opt.NumLevelZeroTablesStall = val
 	return opt
 }
 
-// WithBaseLevelSize sets the maximum size target for the base level.
+// WithLevelOneSize returns a new Options value with LevelOneSize set to the given value.
 //
-// The default value is 10MB.
-func (opt Options) WithBaseLevelSize(val int64) Options {
-	opt.BaseLevelSize = val
+// LevelOneSize sets the maximum total size for Level 1.
+//
+// The default value of LevelOneSize is 20MB.
+func (opt Options) WithLevelOneSize(val int64) Options {
+	opt.LevelOneSize = val
 	return opt
 }
 
-// WithValueLogFileSize sets the maximum size of a single value log file.
+// WithValueLogFileSize returns a new Options value with ValueLogFileSize set to the given value.
+//
+// ValueLogFileSize sets the maximum size of a single value log file.
 //
 // The default value of ValueLogFileSize is 1GB.
 func (opt Options) WithValueLogFileSize(val int64) Options {
@@ -590,9 +440,12 @@ func (opt Options) WithValueLogFileSize(val int64) Options {
 	return opt
 }
 
-// WithValueLogMaxEntries sets the maximum number of entries a value log file
-// can hold approximately.  A actual size limit of a value log file is the
-// minimum of ValueLogFileSize and ValueLogMaxEntries.
+// WithValueLogMaxEntries returns a new Options value with ValueLogMaxEntries set to the given
+// value.
+//
+// ValueLogMaxEntries sets the maximum number of entries a value log file can hold approximately.
+// A actual size limit of a value log file is the minimum of ValueLogFileSize and
+// ValueLogMaxEntries.
 //
 // The default value of ValueLogMaxEntries is one million (1000000).
 func (opt Options) WithValueLogMaxEntries(val uint32) Options {
@@ -600,25 +453,46 @@ func (opt Options) WithValueLogMaxEntries(val uint32) Options {
 	return opt
 }
 
-// WithNumCompactors sets the number of compaction workers to run concurrently.  Setting this to
-// zero stops compactions, which could eventually cause writes to block forever.
+// WithNumCompactors returns a new Options value with NumCompactors set to the given value.
 //
-// The default value of NumCompactors is 4. One is dedicated just for L0 and L1.
+// NumCompactors sets the number of compaction workers to run concurrently.
+// Setting this to zero stops compactions, which could eventually cause writes to block forever.
+//
+// The default value of NumCompactors is 2.
 func (opt Options) WithNumCompactors(val int) Options {
 	opt.NumCompactors = val
 	return opt
 }
 
-// WithCompactL0OnClose determines whether Level 0 should be compacted before closing the DB.  This
-// ensures that both reads and writes are efficient when the DB is opened later.
+// WithCompactL0OnClose returns a new Options value with CompactL0OnClose set to the given value.
 //
-// The default value of CompactL0OnClose is false.
+// CompactL0OnClose determines whether Level 0 should be compacted before closing the DB.
+// This ensures that both reads and writes are efficient when the DB is opened later.
+// CompactL0OnClose is set to true if KeepL0InMemory is set to true.
+//
+// The default value of CompactL0OnClose is true.
 func (opt Options) WithCompactL0OnClose(val bool) Options {
 	opt.CompactL0OnClose = val
 	return opt
 }
 
-// WithEncryptionKey is used to encrypt the data with AES. Type of AES is used based on the key
+// WithLogRotatesToFlush returns a new Options value with LogRotatesToFlush set to the given value.
+//
+// LogRotatesToFlush sets the number of value log file rotates after which the Memtables are
+// flushed to disk. This is useful in write loads with fewer keys and larger values. This work load
+// would fill up the value logs quickly, while not filling up the Memtables. Thus, on a crash
+// and restart, the value log head could cause the replay of a good number of value log files
+// which can slow things on start.
+//
+// The default value of LogRotatesToFlush is 2.
+func (opt Options) WithLogRotatesToFlush(val int32) Options {
+	opt.LogRotatesToFlush = val
+	return opt
+}
+
+// WithEncryptionKey return a new Options value with EncryptionKey set to the given value.
+//
+// EncryptionKey is used to encrypt the data with AES. Type of AES is used based on the key
 // size. For example 16 bytes will use AES-128. 24 bytes will use AES-192. 32 bytes will
 // use AES-256.
 func (opt Options) WithEncryptionKey(key []byte) Options {
@@ -626,31 +500,47 @@ func (opt Options) WithEncryptionKey(key []byte) Options {
 	return opt
 }
 
-// WithEncryptionKeyRotationDuration returns new Options value with the duration set to
+// WithEncryptionRotationDuration returns new Options value with the duration set to
 // the given value.
 //
 // Key Registry will use this duration to create new keys. If the previous generated
 // key exceed the given duration. Then the key registry will create new key.
-
-// The default value is set to 10 days.
 func (opt Options) WithEncryptionKeyRotationDuration(d time.Duration) Options {
 	opt.EncryptionKeyRotationDuration = d
 	return opt
 }
 
-// WithCompression is used to enable or disable compression. When compression is enabled, every
-// block will be compressed using the specified algorithm.  This option doesn't affect existing
-// tables. Only the newly created tables will be compressed.
+// WithKeepL0InMemory returns a new Options value with KeepL0InMemory set to the given value.
 //
-// The default compression algorithm used is snappy. Compression is enabled by default.
+// When KeepL0InMemory is set to true we will keep all Level 0 tables in memory. This leads to
+// better performance in writes as well as compactions. In case of DB crash, the value log replay
+// will take longer to complete since memtables and all level 0 tables will have to be recreated.
+// This option also sets CompactL0OnClose option to true.
+//
+// The default value of KeepL0InMemory is false.
+func (opt Options) WithKeepL0InMemory(val bool) Options {
+	opt.KeepL0InMemory = val
+	return opt
+}
+
+// WithCompression returns a new Options value with Compression set to the given value.
+//
+// When compression is enabled, every block will be compressed using the specified algorithm.
+// This option doesn't affect existing tables. Only the newly created tables will be compressed.
+//
+// The default compression algorithm used is zstd when built with Cgo. Without Cgo, the default is
+// snappy. Compression is enabled by default.
 func (opt Options) WithCompression(cType options.CompressionType) Options {
 	opt.Compression = cType
 	return opt
 }
 
-// WithVerifyValueChecksum is used to set VerifyValueChecksum. When VerifyValueChecksum is set to
-// true, checksum will be verified for every entry read from the value log. If the value is stored
-// in SST (value size less than value threshold) then the checksum validation will not be done.
+// WithVerifyValueChecksum returns a new Options value with VerifyValueChecksum set to
+// the given value.
+//
+// When VerifyValueChecksum is set to true, checksum will be verified for every entry read
+// from the value log. If the value is stored in SST (value size less than value threshold) then the
+// checksum validation will not be done.
 //
 // The default value of VerifyValueChecksum is False.
 func (opt Options) WithVerifyValueChecksum(val bool) Options {
@@ -669,18 +559,18 @@ func (opt Options) WithChecksumVerificationMode(cvMode options.ChecksumVerificat
 	return opt
 }
 
-// WithBlockCacheSize returns a new Options value with BlockCacheSize set to the given value.
+// WithMaxCacheSize returns a new Options value with MaxCacheSize set to the given value.
 //
-// This value specifies how much data cache should hold in memory. A small size
-// of cache means lower memory consumption and lookups/iterations would take
-// longer. It is recommended to use a cache if you're using compression or encryption.
+// This value specifies how much data cache should hold in memory. A small size of cache means lower
+// memory consumption and lookups/iterations would take longer.
+// It is recommended to use a cache if you're using compression or encryption.
 // If compression and encryption both are disabled, adding a cache will lead to
-// unnecessary overhead which will affect the read performance. Setting size to
-// zero disables the cache altogether.
+// unnecessary overhead which will affect the read performance. Setting size to zero disables the
+// cache altogether.
 //
-// Default value of BlockCacheSize is 256 MB.
-func (opt Options) WithBlockCacheSize(size int64) Options {
-	opt.BlockCacheSize = size
+// Default value of MaxCacheSize is zero.
+func (opt Options) WithMaxCacheSize(size int64) Options {
+	opt.MaxCacheSize = size
 	return opt
 }
 
@@ -706,7 +596,6 @@ func (opt Options) WithInMemory(b bool) Options {
 // algorithm is small (4 KB), we don't get significant benefit at level 3. It is advised to write
 // your own benchmarks before choosing a compression algorithm or level.
 //
-// NOTE: The benchmarks are with DataDog ZSTD that requires CGO. Hence, no longer valid.
 // no_compression-16              10	 502848865 ns/op	 165.46 MB/s	-
 // zstd_compression/level_1-16     7	 739037966 ns/op	 112.58 MB/s	2.93
 // zstd_compression/level_3-16     7	 756950250 ns/op	 109.91 MB/s	2.72
@@ -730,21 +619,32 @@ func (opt Options) WithBypassLockGuard(b bool) Options {
 	return opt
 }
 
-// WithIndexCacheSize returns a new Options value with IndexCacheSize set to
-// the given value.
+// WithMaxBfCacheSize returns a new Options value with MaxBfCacheSize set to the given value.
 //
-// This value specifies how much memory should be used by table indices. These
-// indices include the block offsets and the bloomfilters. Badger uses bloom
-// filters to speed up lookups. Each table has its own bloom
+// This value specifies how much memory should be used by the bloom filters.
+// Badger uses bloom filters to speed up lookups. Each table has its own bloom
 // filter and each bloom filter is approximately of 5 MB.
 //
-// Zero value for IndexCacheSize means all the indices will be kept in
+// Zero value for BfCacheSize means all the bloom filters will be kept in
 // memory and the cache is disabled.
 //
-// The default value of IndexCacheSize is 0 which means all indices are kept in
-// memory.
-func (opt Options) WithIndexCacheSize(size int64) Options {
-	opt.IndexCacheSize = size
+// The default value of MaxBfCacheSize is 0 which means all bloom filters will
+// be kept in memory.
+func (opt Options) WithMaxBfCacheSize(size int64) Options {
+	opt.MaxBfCacheSize = size
+	return opt
+}
+
+// WithLoadBloomsOnOpen returns a new Options value with LoadBloomsOnOpen set to the given value.
+//
+// Badger uses bloom filters to speed up key lookups. When LoadBloomsOnOpen is set
+// to false, all bloom filters will be loaded on DB open. This is supposed to
+// improve the read speed but it will affect the time taken to open the DB. Set
+// this option to true to reduce the time taken to open the DB.
+//
+// The default value of LoadBloomsOnOpen is false.
+func (opt Options) WithLoadBloomsOnOpen(b bool) Options {
+	opt.LoadBloomsOnOpen = b
 	return opt
 }
 
@@ -762,30 +662,37 @@ func (opt Options) WithDetectConflicts(b bool) Options {
 	return opt
 }
 
-// WithNamespaceOffset returns a new Options value with NamespaceOffset set to the given value. DB
-// will expect the namespace in each key at the 8 bytes starting from NamespaceOffset. A negative
-// value means that namespace is not stored in the key.
+// WithKeepBlockIndicesInCache returns a new Option value with KeepBlockOffsetInCache set to the
+// given value.
 //
-// The default value for NamespaceOffset is -1.
-func (opt Options) WithNamespaceOffset(offset int) Options {
-	opt.NamespaceOffset = offset
-	return opt
-}
+// When this option is set badger will store the block offsets in a cache along with the blocks.
+// The size of the cache is determined by the MaxCacheSize option.If the MaxCacheSize is set to
+// zero, then MaxCacheSize is set to 100 mb. When indices are stored in the cache, the read
+// performance might be affected but the cache limits the amount of memory used by the indices.
+//
+// The default value of KeepBlockOffsetInCache is false.
+func (opt Options) WithKeepBlockIndicesInCache(val bool) Options {
+	opt.KeepBlockIndicesInCache = val
 
-// WithExternalMagic returns a new Options value with ExternalMagicVersion set to the given value.
-// The DB would fail to start if either the internal or the external magic number fails validated.
-func (opt Options) WithExternalMagic(magic uint16) Options {
-	opt.ExternalMagicVersion = magic
-	return opt
-}
-
-func (opt Options) getFileFlags() int {
-	var flags int
-	// opt.SyncWrites would be using msync to sync. All writes go through mmap.
-	if opt.ReadOnly {
-		flags |= os.O_RDONLY
-	} else {
-		flags |= os.O_RDWR
+	if val && opt.MaxCacheSize == 0 {
+		opt.MaxCacheSize = 100 << 20
 	}
-	return flags
+	return opt
+}
+
+// WithKeepBlocksInCache returns a new Option value with KeepBlocksInCache set to the
+// given value.
+//
+// When this option is set badger will store the block in the cache. The size of the cache is
+// determined by the MaxCacheSize option.If the MaxCacheSize is set to zero,
+// then MaxCacheSize is set to 100 mb.
+//
+// The default value of KeepBlocksInCache is false.
+func (opt Options) WithKeepBlocksInCache(val bool) Options {
+	opt.KeepBlocksInCache = val
+
+	if val && opt.MaxCacheSize == 0 {
+		opt.MaxCacheSize = 100 << 20
+	}
+	return opt
 }

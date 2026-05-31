@@ -1,19 +1,28 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package cmd
 
 import (
 	"errors"
-	"math"
 	"os"
-	"path/filepath"
+	"path"
 
+	"github.com/dgraph-io/badger/v2"
 	"github.com/spf13/cobra"
-
-	"github.com/kinet-labs/zapdb"
 )
 
 var restoreFile string
@@ -46,7 +55,7 @@ func init() {
 
 func doRestore(cmd *cobra.Command, args []string) error {
 	// Check if the DB already exists
-	manifestFile := filepath.Join(sstDir, badger.ManifestFilename)
+	manifestFile := path.Join(sstDir, badger.ManifestFilename)
 	if _, err := os.Stat(manifestFile); err == nil { // No error. File already exists.
 		return errors.New("Cannot restore to an already existing database")
 	} else if os.IsNotExist(err) {
@@ -56,9 +65,7 @@ func doRestore(cmd *cobra.Command, args []string) error {
 	}
 
 	// Open DB
-	db, err := badger.Open(badger.DefaultOptions(sstDir).
-		WithValueDir(vlogDir).
-		WithNumVersionsToKeep(math.MaxInt32))
+	db, err := badger.Open(badger.DefaultOptions(sstDir).WithValueDir(vlogDir))
 	if err != nil {
 		return err
 	}

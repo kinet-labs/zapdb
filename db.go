@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
@@ -9,174 +20,220 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
 	"expvar"
-	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/dgraph-io/badger/v2/options"
+	"github.com/dgraph-io/badger/v2/pb"
+	"github.com/dgraph-io/badger/v2/skl"
+	"github.com/dgraph-io/badger/v2/table"
+	"github.com/dgraph-io/badger/v2/y"
+	"github.com/dgraph-io/ristretto"
 	humanize "github.com/dustin/go-humanize"
-
-	"github.com/kinet-labs/zapdb/fb"
-	"github.com/kinet-labs/zapdb/options"
-	"github.com/kinet-labs/zapdb/pb"
-	"github.com/kinet-labs/zapdb/skl"
-	"github.com/kinet-labs/zapdb/table"
-	"github.com/kinet-labs/zapdb/y"
-	"github.com/dgraph-io/ristretto/v2"
-	"github.com/dgraph-io/ristretto/v2/z"
+	"github.com/pkg/errors"
 )
 
 var (
-	badgerPrefix = []byte("!badger!")       // Prefix for internal keys used by badger.
-	txnKey       = []byte("!badger!txn")    // For indicating end of entries in txn.
-	bannedNsKey  = []byte("!badger!banned") // For storing the banned namespaces.
+	badgerPrefix      = []byte("!badger!")        // Prefix for internal keys used by badger.
+	head              = []byte("!badger!head")    // For storing value offset for replay.
+	txnKey            = []byte("!badger!txn")     // For indicating end of entries in txn.
+	badgerMove        = []byte("!badger!move")    // For key-value pairs which got moved during GC.
+	lfDiscardStatsKey = []byte("!badger!discard") // For storing lfDiscardStats
 )
 
 type closers struct {
-	updateSize  *z.Closer
-	compactors  *z.Closer
-	memtable    *z.Closer
-	writes      *z.Closer
-	valueGC     *z.Closer
-	pub         *z.Closer
-	cacheHealth *z.Closer
-}
-
-type lockedKeys struct {
-	sync.RWMutex
-	keys map[uint64]struct{}
-}
-
-func (lk *lockedKeys) add(key uint64) {
-	lk.Lock()
-	defer lk.Unlock()
-	lk.keys[key] = struct{}{}
-}
-
-func (lk *lockedKeys) has(key uint64) bool {
-	lk.RLock()
-	defer lk.RUnlock()
-	_, ok := lk.keys[key]
-	return ok
-}
-
-func (lk *lockedKeys) all() []uint64 {
-	lk.RLock()
-	defer lk.RUnlock()
-	keys := make([]uint64, 0, len(lk.keys))
-	for key := range lk.keys {
-		keys = append(keys, key)
-	}
-	return keys
+	updateSize *y.Closer
+	compactors *y.Closer
+	memtable   *y.Closer
+	writes     *y.Closer
+	valueGC    *y.Closer
+	pub        *y.Closer
 }
 
 // DB provides the various functions required to interact with Badger.
 // DB is thread-safe.
 type DB struct {
-	testOnlyDBExtensions
-
-	lock sync.RWMutex // Guards list of inmemory tables, not individual reads and writes.
+	sync.RWMutex // Guards list of inmemory tables, not individual reads and writes.
 
 	dirLockGuard *directoryLockGuard
 	// nil if Dir and ValueDir are the same
 	valueDirGuard *directoryLockGuard
 
-	closers closers
-
-	mt  *memTable   // Our latest (actively written) in-memory table
-	imm []*memTable // Add here only AFTER pushing to flushChan.
-
-	// Initialized via openMemTables.
-	nextMemFid int
-
+	closers   closers
+	mt        *skl.Skiplist   // Our latest (actively written) in-memory table
+	imm       []*skl.Skiplist // Add here only AFTER pushing to flushChan.
 	opt       Options
 	manifest  *manifestFile
 	lc        *levelsController
 	vlog      valueLog
+	vhead     valuePointer // less than or equal to a pointer to the last vlog value put into mt
 	writeCh   chan *request
-	flushChan chan *memTable // For flushing memtables.
+	flushChan chan flushTask // For flushing memtables.
 	closeOnce sync.Once      // For closing DB only once.
 
-	blockWrites atomic.Int32
-	isClosed    atomic.Uint32
+	// Number of log rotates since the last memtable flush. We will access this field via atomic
+	// functions. Since we are not going to use any 64bit atomic functions, there is no need for
+	// 64 bit alignment of this struct(see #311).
+	logRotates int32
 
-	orc              *oracle
-	bannedNamespaces *lockedKeys
-	threshold        *vlogThreshold
+	blockWrites int32
+
+	orc *oracle
 
 	pub        *publisher
 	registry   *KeyRegistry
-	blockCache *ristretto.Cache[[]byte, *table.Block]
-	indexCache *ristretto.Cache[uint64, *fb.TableIndex]
-	allocPool  *z.AllocatorPool
+	blockCache *ristretto.Cache
+	bfCache    *ristretto.Cache
 }
 
 const (
 	kvWriteChCapacity = 1000
 )
 
-func checkAndSetOptions(opt *Options) error {
-	// It's okay to have zero compactors which will disable all compactions but
-	// we cannot have just one compactor otherwise we will end up with all data
-	// on level 2.
-	if opt.NumCompactors == 1 {
-		return errors.New("Cannot have 1 compactor. Need at least 2")
+func (db *DB) replayFunction() func(Entry, valuePointer) error {
+	type txnEntry struct {
+		nk []byte
+		v  y.ValueStruct
 	}
 
+	var txn []txnEntry
+	var lastCommit uint64
+
+	toLSM := func(nk []byte, vs y.ValueStruct) {
+		for err := db.ensureRoomForWrite(); err != nil; err = db.ensureRoomForWrite() {
+			db.opt.Debugf("Replay: Making room for writes")
+			time.Sleep(10 * time.Millisecond)
+		}
+		db.mt.Put(nk, vs)
+	}
+
+	first := true
+	return func(e Entry, vp valuePointer) error { // Function for replaying.
+		if first {
+			db.opt.Debugf("First key=%q\n", e.Key)
+		}
+		first = false
+		db.orc.Lock()
+		if db.orc.nextTxnTs < y.ParseTs(e.Key) {
+			db.orc.nextTxnTs = y.ParseTs(e.Key)
+		}
+		db.orc.Unlock()
+
+		nk := make([]byte, len(e.Key))
+		copy(nk, e.Key)
+		var nv []byte
+		meta := e.meta
+		if db.shouldWriteValueToLSM(e) {
+			nv = make([]byte, len(e.Value))
+			copy(nv, e.Value)
+		} else {
+			nv = vp.Encode()
+			meta = meta | bitValuePointer
+			// Update vhead. If the crash happens while replay was in progess
+			// and the head is not updated, we will end up replaying all the
+			// files again.
+			db.updateHead([]valuePointer{vp})
+		}
+
+		v := y.ValueStruct{
+			Value:     nv,
+			Meta:      meta,
+			UserMeta:  e.UserMeta,
+			ExpiresAt: e.ExpiresAt,
+		}
+
+		switch {
+		case e.meta&bitFinTxn > 0:
+			txnTs, err := strconv.ParseUint(string(e.Value), 10, 64)
+			if err != nil {
+				return errors.Wrapf(err, "Unable to parse txn fin: %q", e.Value)
+			}
+			y.AssertTrue(lastCommit == txnTs)
+			y.AssertTrue(len(txn) > 0)
+			// Got the end of txn. Now we can store them.
+			for _, t := range txn {
+				toLSM(t.nk, t.v)
+			}
+			txn = txn[:0]
+			lastCommit = 0
+
+		case e.meta&bitTxn > 0:
+			txnTs := y.ParseTs(nk)
+			if lastCommit == 0 {
+				lastCommit = txnTs
+			}
+			if lastCommit != txnTs {
+				db.opt.Warningf("Found an incomplete txn at timestamp %d. Discarding it.\n",
+					lastCommit)
+				txn = txn[:0]
+				lastCommit = txnTs
+			}
+			te := txnEntry{nk: nk, v: v}
+			txn = append(txn, te)
+
+		default:
+			// This entry is from a rewrite or via SetEntryAt(..).
+			toLSM(nk, v)
+
+			// We shouldn't get this entry in the middle of a transaction.
+			y.AssertTrue(lastCommit == 0)
+			y.AssertTrue(len(txn) == 0)
+		}
+		return nil
+	}
+}
+
+// Open returns a new DB object.
+func Open(opt Options) (db *DB, err error) {
 	if opt.InMemory && (opt.Dir != "" || opt.ValueDir != "") {
-		return errors.New("Cannot use badger in Disk-less mode with Dir or ValueDir set")
+		return nil, errors.New("Cannot use badger in Disk-less mode with Dir or ValueDir set")
 	}
-	opt.maxBatchSize = (15 * opt.MemTableSize) / 100
+	opt.maxBatchSize = (15 * opt.MaxTableSize) / 100
 	opt.maxBatchCount = opt.maxBatchSize / int64(skl.MaxNodeSize)
-
-	// This is the maximum value, vlogThreshold can have if dynamic thresholding is enabled.
-	opt.maxValueThreshold = math.Min(maxValueThreshold, float64(opt.maxBatchSize))
-	if opt.VLogPercentile < 0.0 || opt.VLogPercentile > 1.0 {
-		return errors.New("vlogPercentile must be within range of 0.0-1.0")
-	}
 
 	// We are limiting opt.ValueThreshold to maxValueThreshold for now.
 	if opt.ValueThreshold > maxValueThreshold {
-		return fmt.Errorf("Invalid ValueThreshold, must be less or equal to %d",
+		return nil, errors.Errorf("Invalid ValueThreshold, must be less or equal to %d",
 			maxValueThreshold)
 	}
 
 	// If ValueThreshold is greater than opt.maxBatchSize, we won't be able to push any data using
 	// the transaction APIs. Transaction batches entries into batches of size opt.maxBatchSize.
-	if opt.ValueThreshold > opt.maxBatchSize {
-		return fmt.Errorf("Valuethreshold %d greater than max batch size of %d. Either "+
-			"reduce opt.ValueThreshold or increase opt.BaseTableSize.",
-			opt.ValueThreshold, opt.maxBatchSize)
+	if int64(opt.ValueThreshold) > opt.maxBatchSize {
+		return nil, errors.Errorf("Valuethreshold greater than max batch size of %d. Either "+
+			"reduce opt.ValueThreshold or increase opt.MaxTableSize.", opt.maxBatchSize)
 	}
-	// ValueLogFileSize should be strictly LESS than 2<<30 otherwise we will
-	// overflow the uint32 when we mmap it in OpenMemtable.
-	if !(opt.ValueLogFileSize < 2<<30 && opt.ValueLogFileSize >= 1<<20) {
-		return ErrValueLogSize
+	if !(opt.ValueLogFileSize <= 2<<30 && opt.ValueLogFileSize >= 1<<20) {
+		return nil, ErrValueLogSize
 	}
+	if !(opt.ValueLogLoadingMode == options.FileIO ||
+		opt.ValueLogLoadingMode == options.MemoryMap) {
+		return nil, ErrInvalidLoadingMode
+	}
+
+	// Return error if badger is built without cgo and compression is set to ZSTD.
+	if opt.Compression == options.ZSTD && !y.CgoEnabled {
+		return nil, y.ErrZstdCgo
+	}
+	// Keep L0 in memory if either KeepL0InMemory is set or if InMemory is set.
+	opt.KeepL0InMemory = opt.KeepL0InMemory || opt.InMemory
+
+	// Compact L0 on close if either it is set or if KeepL0InMemory is set. When
+	// keepL0InMemory is set we need to compact L0 on close otherwise we might lose data.
+	opt.CompactL0OnClose = opt.CompactL0OnClose || opt.KeepL0InMemory
 
 	if opt.ReadOnly {
+		// Can't truncate if the DB is read only.
+		opt.Truncate = false
 		// Do not perform compaction in read only mode.
 		opt.CompactL0OnClose = false
-	}
-
-	needCache := (opt.Compression != options.None) || (len(opt.EncryptionKey) > 0)
-	if needCache && opt.BlockCacheSize == 0 {
-		panic("BlockCacheSize should be set since compression/encryption are enabled")
-	}
-	return nil
-}
-
-// Open returns a new DB object.
-func Open(opt Options) (*DB, error) {
-	if err := checkAndSetOptions(&opt); err != nil {
-		return nil, err
 	}
 	var dirLockGuard, valueDirLockGuard *directoryLockGuard
 
@@ -187,7 +244,6 @@ func Open(opt Options) (*DB, error) {
 		if err := createDirs(opt); err != nil {
 			return nil, err
 		}
-		var err error
 		if !opt.BypassLockGuard {
 			dirLockGuard, err = acquireDirectoryLock(opt.Dir, lockFile, opt.ReadOnly)
 			if err != nil {
@@ -230,78 +286,52 @@ func Open(opt Options) (*DB, error) {
 		}
 	}()
 
-	db := &DB{
-		imm:              make([]*memTable, 0, opt.NumMemtables),
-		flushChan:        make(chan *memTable, opt.NumMemtables),
-		writeCh:          make(chan *request, kvWriteChCapacity),
-		opt:              opt,
-		manifest:         manifestFile,
-		dirLockGuard:     dirLockGuard,
-		valueDirGuard:    valueDirLockGuard,
-		orc:              newOracle(opt),
-		pub:              newPublisher(),
-		allocPool:        z.NewAllocatorPool(8),
-		bannedNamespaces: &lockedKeys{keys: make(map[uint64]struct{})},
-		threshold:        initVlogThreshold(&opt),
+	db = &DB{
+		imm:           make([]*skl.Skiplist, 0, opt.NumMemtables),
+		flushChan:     make(chan flushTask, opt.NumMemtables),
+		writeCh:       make(chan *request, kvWriteChCapacity),
+		opt:           opt,
+		manifest:      manifestFile,
+		dirLockGuard:  dirLockGuard,
+		valueDirGuard: valueDirLockGuard,
+		orc:           newOracle(opt),
+		pub:           newPublisher(),
 	}
-
-	db.syncChan = opt.syncChan
-
 	// Cleanup all the goroutines started by badger in case of an error.
 	defer func() {
 		if err != nil {
-			opt.Errorf("Received err: %v. Cleaning up...", err)
 			db.cleanup()
 			db = nil
 		}
 	}()
 
-	if opt.BlockCacheSize > 0 {
-		numInCache := opt.BlockCacheSize / int64(opt.BlockSize)
-		if numInCache == 0 {
-			// Make the value of this variable at least one since the cache requires
-			// the number of counters to be greater than zero.
-			numInCache = 1
-		}
-
-		config := ristretto.Config[[]byte, *table.Block]{
-			NumCounters: numInCache * 8,
-			MaxCost:     opt.BlockCacheSize,
-			BufferItems: 64,
-			Metrics:     true,
-			OnExit:      table.BlockEvictHandler,
-		}
-		db.blockCache, err = ristretto.NewCache[[]byte, *table.Block](&config)
-		if err != nil {
-			return nil, y.Wrap(err, "failed to create data cache")
-		}
-	}
-
-	if opt.IndexCacheSize > 0 {
-		// Index size is around 5% of the table size.
-		indexSz := int64(float64(opt.MemTableSize) * 0.05)
-		numInCache := opt.IndexCacheSize / indexSz
-		if numInCache == 0 {
-			// Make the value of this variable at least one since the cache requires
-			// the number of counters to be greater than zero.
-			numInCache = 1
-		}
-
-		config := ristretto.Config[uint64, *fb.TableIndex]{
-			NumCounters: numInCache * 8,
-			MaxCost:     opt.IndexCacheSize,
+	if opt.MaxCacheSize > 0 {
+		config := ristretto.Config{
+			// Use 5% of cache memory for storing counters.
+			NumCounters: int64(float64(opt.MaxCacheSize) * 0.05 * 2),
+			MaxCost:     int64(float64(opt.MaxCacheSize) * 0.95),
 			BufferItems: 64,
 			Metrics:     true,
 		}
-		db.indexCache, err = ristretto.NewCache(&config)
+		db.blockCache, err = ristretto.NewCache(&config)
 		if err != nil {
-			return nil, y.Wrap(err, "failed to create bf cache")
+			return nil, errors.Wrap(err, "failed to create data cache")
 		}
 	}
 
-	db.closers.cacheHealth = z.NewCloser(1)
-	go db.monitorCache(db.closers.cacheHealth)
-
+	if opt.MaxBfCacheSize > 0 {
+		config := ristretto.Config{
+			// Use 5% of cache memory for storing counters.
+			NumCounters: int64(float64(opt.MaxBfCacheSize) * 0.05 * 2),
+			MaxCost:     int64(float64(opt.MaxBfCacheSize) * 0.95),
+			BufferItems: 64,
+			Metrics:     true,
+		}
+		db.bfCache, err = ristretto.NewCache(&config)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create bf cache")
+		}
+	}
 	if db.opt.InMemory {
 		db.opt.SyncWrites = false
 		// If badger is running in memory mode, push everything into the LSM Tree.
@@ -319,18 +349,9 @@ func Open(opt Options) (*DB, error) {
 		return db, err
 	}
 	db.calculateSize()
-	db.closers.updateSize = z.NewCloser(1)
+	db.closers.updateSize = y.NewCloser(1)
 	go db.updateSize(db.closers.updateSize)
-
-	if err := db.openMemTables(db.opt); err != nil {
-		return nil, y.Wrapf(err, "while opening memtables")
-	}
-
-	if !db.opt.ReadOnly {
-		if db.mt, err = db.newMemTable(); err != nil {
-			return nil, y.Wrapf(err, "cannot create memtable")
-		}
-	}
+	db.mt = skl.NewSkiplist(arenaSize(opt))
 
 	// newLevelsController potentially loads files in directory.
 	if db.lc, err = newLevelsController(db, &manifest); err != nil {
@@ -341,25 +362,35 @@ func Open(opt Options) (*DB, error) {
 	db.vlog.init(db)
 
 	if !opt.ReadOnly {
-		db.closers.compactors = z.NewCloser(1)
+		db.closers.compactors = y.NewCloser(1)
 		db.lc.startCompact(db.closers.compactors)
 
-		db.closers.memtable = z.NewCloser(1)
+		db.closers.memtable = y.NewCloser(1)
 		go func() {
-			db.flushMemtable(db.closers.memtable) // Need levels controller to be up.
+			_ = db.flushMemtable(db.closers.memtable) // Need levels controller to be up.
 		}()
-		// Flush them to disk asap.
-		for _, mt := range db.imm {
-			db.flushChan <- mt
-		}
 	}
-	// We do increment nextTxnTs below. So, no need to do it here.
-	db.orc.nextTxnTs = db.MaxVersion()
-	db.opt.Infof("Set nextTxnTs to %d", db.orc.nextTxnTs)
 
-	if err = db.vlog.open(db); err != nil {
+	headKey := y.KeyWithTs(head, math.MaxUint64)
+	// Need to pass with timestamp, lsm get removes the last 8 bytes and compares key
+	vs, err := db.get(headKey)
+	if err != nil {
+		return db, errors.Wrap(err, "Retrieving head")
+	}
+	db.orc.nextTxnTs = vs.Version
+	var vptr valuePointer
+	if len(vs.Value) > 0 {
+		vptr.Decode(vs.Value)
+	}
+
+	replayCloser := y.NewCloser(1)
+	go db.doWrites(replayCloser)
+
+	if err = db.vlog.open(db, vptr, db.replayFunction()); err != nil {
+		replayCloser.SignalAndWait()
 		return db, y.Wrapf(err, "During db.vlog.open")
 	}
+	replayCloser.SignalAndWait() // Wait for replay to be applied first.
 
 	// Let's advance nextTxnTs to one more than whatever we observed via
 	// replaying the logs.
@@ -369,21 +400,15 @@ func Open(opt Options) (*DB, error) {
 	db.orc.readMark.Done(db.orc.nextTxnTs)
 	db.orc.incrementNextTs()
 
-	go db.threshold.listenForValueThresholdUpdate()
-
-	if err := db.initBannedNamespaces(); err != nil {
-		return db, fmt.Errorf("While setting banned keys: %w", err)
-	}
-
-	db.closers.writes = z.NewCloser(1)
+	db.closers.writes = y.NewCloser(1)
 	go db.doWrites(db.closers.writes)
 
 	if !db.opt.InMemory {
-		db.closers.valueGC = z.NewCloser(1)
+		db.closers.valueGC = y.NewCloser(1)
 		go db.vlog.waitOnGC(db.closers.valueGC)
 	}
 
-	db.closers.pub = z.NewCloser(1)
+	db.closers.pub = y.NewCloser(1)
 	go db.pub.listenForUpdates(db.closers.pub)
 
 	valueDirLockGuard = nil
@@ -392,92 +417,14 @@ func Open(opt Options) (*DB, error) {
 	return db, nil
 }
 
-// initBannedNamespaces retrieves the banned namespaces from the DB and updates in-memory structure.
-func (db *DB) initBannedNamespaces() error {
-	if db.opt.NamespaceOffset < 0 {
-		return nil
-	}
-	return db.View(func(txn *Txn) error {
-		iopts := DefaultIteratorOptions
-		iopts.Prefix = bannedNsKey
-		iopts.PrefetchValues = false
-		iopts.InternalAccess = true
-		itr := txn.NewIterator(iopts)
-		defer itr.Close()
-		for itr.Rewind(); itr.Valid(); itr.Next() {
-			key := y.BytesToU64(itr.Item().Key()[len(bannedNsKey):])
-			db.bannedNamespaces.add(key)
-		}
-		return nil
-	})
-}
-
-func (db *DB) MaxVersion() uint64 {
-	var maxVersion uint64
-	update := func(a uint64) {
-		if a > maxVersion {
-			maxVersion = a
-		}
-	}
-	db.lock.Lock()
-	// In read only mode, we do not create new mem table.
-	if !db.opt.ReadOnly {
-		update(db.mt.maxVersion)
-	}
-	for _, mt := range db.imm {
-		update(mt.maxVersion)
-	}
-	db.lock.Unlock()
-	for _, ti := range db.Tables() {
-		update(ti.MaxVersion)
-	}
-	return maxVersion
-}
-
-func (db *DB) monitorCache(c *z.Closer) {
-	defer c.Done()
-	count := 0
-	analyze := func(name string, metrics *ristretto.Metrics) {
-		// If the mean life expectancy is less than 10 seconds, the cache
-		// might be too small.
-		le := metrics.LifeExpectancySeconds()
-		if le == nil {
-			return
-		}
-		lifeTooShort := le.Count > 0 && float64(le.Sum)/float64(le.Count) < 10
-		hitRatioTooLow := metrics.Ratio() > 0 && metrics.Ratio() < 0.4
-		if lifeTooShort && hitRatioTooLow {
-			db.opt.Warningf("%s might be too small. Metrics: %s\n", name, metrics)
-			db.opt.Warningf("Cache life expectancy (in seconds): %+v\n", le)
-
-		} else if le.Count > 1000 && count%5 == 0 {
-			db.opt.Infof("%s metrics: %s\n", name, metrics)
-		}
-	}
-
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-c.HasBeenClosed():
-			return
-		case <-ticker.C:
-		}
-
-		analyze("Block cache", db.BlockCacheMetrics())
-		analyze("Index cache", db.IndexCacheMetrics())
-		count++
-	}
-}
-
 // cleanup stops all the goroutines started by badger. This is used in open to
 // cleanup goroutines in case of an error.
 func (db *DB) cleanup() {
+	db.blockCache.Close()
+	db.bfCache.Close()
 	db.stopMemoryFlush()
 	db.stopCompactions()
 
-	db.blockCache.Close()
-	db.indexCache.Close()
 	if db.closers.updateSize != nil {
 		db.closers.updateSize.Signal()
 	}
@@ -492,23 +439,21 @@ func (db *DB) cleanup() {
 	}
 
 	db.orc.Stop()
-
-	// Do not use vlog.Close() here. vlog.Close truncates the files. We don't
-	// want to truncate files unless the user has specified the truncate flag.
+	db.vlog.Close()
 }
 
-// BlockCacheMetrics returns the metrics for the underlying block cache.
-func (db *DB) BlockCacheMetrics() *ristretto.Metrics {
+// DataCacheMetrics returns the metrics for the underlying data cache.
+func (db *DB) DataCacheMetrics() *ristretto.Metrics {
 	if db.blockCache != nil {
 		return db.blockCache.Metrics
 	}
 	return nil
 }
 
-// IndexCacheMetrics returns the metrics for the underlying index cache.
-func (db *DB) IndexCacheMetrics() *ristretto.Metrics {
-	if db.indexCache != nil {
-		return db.indexCache.Metrics
+// BfCacheMetrics returns the metrics for the underlying bloom filter cache.
+func (db *DB) BfCacheMetrics() *ristretto.Metrics {
+	if db.bfCache != nil {
+		return db.bfCache.Metrics
 	}
 	return nil
 }
@@ -523,20 +468,10 @@ func (db *DB) Close() error {
 	return err
 }
 
-// IsClosed denotes if the badger DB is closed or not. A DB instance should not
-// be used after closing it.
-func (db *DB) IsClosed() bool {
-	return db.isClosed.Load() == 1
-}
-
 func (db *DB) close() (err error) {
-	defer db.allocPool.Release()
-
 	db.opt.Debugf("Closing database")
-	db.opt.Infof("Lifetime L0 stalled for: %s\n", time.Duration(db.lc.l0stallsMs.Load()))
 
-	db.blockWrites.Store(1)
-	db.isClosed.Store(1)
+	atomic.StoreInt32(&db.blockWrites, 1)
 
 	if !db.opt.InMemory {
 		// Stop value GC first.
@@ -550,43 +485,41 @@ func (db *DB) close() (err error) {
 	close(db.writeCh)
 
 	db.closers.pub.SignalAndWait()
-	db.closers.cacheHealth.Signal()
+
+	// Now close the value log.
+	if vlogErr := db.vlog.Close(); vlogErr != nil {
+		err = errors.Wrap(vlogErr, "DB.Close")
+	}
 
 	// Make sure that block writer is done pushing stuff into memtable!
 	// Otherwise, you will have a race condition: we are trying to flush memtables
 	// and remove them completely, while the block / memtable writer is still
 	// trying to push stuff into the memtable. This will also resolve the value
 	// offset problem: as we push into memtable, we update value offsets there.
-	if db.mt != nil {
-		if db.mt.sl.Empty() {
-			// Remove the memtable if empty.
-			db.mt.DecrRef()
-		} else {
-			db.opt.Debugf("Flushing memtable")
-			for {
-				pushedMemTable := func() bool {
-					db.lock.Lock()
-					defer db.lock.Unlock()
-					y.AssertTrue(db.mt != nil)
-					select {
-					case db.flushChan <- db.mt:
-						db.imm = append(db.imm, db.mt) // Flusher will attempt to remove this from s.imm.
-						db.mt = nil                    // Will segfault if we try writing!
-						db.opt.Debugf("pushed to flush chan\n")
-						return true
-					default:
-						// If we fail to push, we need to unlock and wait for a short while.
-						// The flushing operation needs to update s.imm. Otherwise, we have a
-						// deadlock.
-						// TODO: Think about how to do this more cleanly, maybe without any locks.
-					}
-					return false
-				}()
-				if pushedMemTable {
-					break
+	if !db.mt.Empty() {
+		db.opt.Debugf("Flushing memtable")
+		for {
+			pushedFlushTask := func() bool {
+				db.Lock()
+				defer db.Unlock()
+				y.AssertTrue(db.mt != nil)
+				select {
+				case db.flushChan <- flushTask{mt: db.mt, vptr: db.vhead}:
+					db.imm = append(db.imm, db.mt) // Flusher will attempt to remove this from s.imm.
+					db.mt = nil                    // Will segfault if we try writing!
+					db.opt.Debugf("pushed to flush chan\n")
+					return true
+				default:
+					// If we fail to push, we need to unlock and wait for a short while.
+					// The flushing operation needs to update s.imm. Otherwise, we have a deadlock.
+					// TODO: Think about how to do this more cleanly, maybe without any locks.
 				}
-				time.Sleep(10 * time.Millisecond)
+				return false
+			}()
+			if pushedFlushTask {
+				break
 			}
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 	db.stopMemoryFlush()
@@ -595,34 +528,26 @@ func (db *DB) close() (err error) {
 	// Force Compact L0
 	// We don't need to care about cstatus since no parallel compaction is running.
 	if db.opt.CompactL0OnClose {
-		err := db.lc.doCompact(173, compactionPriority{level: 0, score: 1.73})
+		err := db.lc.doCompact(compactionPriority{level: 0, score: 1.73})
 		switch err {
 		case errFillTables:
 			// This error only means that there might be enough tables to do a compaction. So, we
 			// should not report it to the end user to avoid confusing them.
 		case nil:
-			db.opt.Debugf("Force compaction on level 0 done")
+			db.opt.Infof("Force compaction on level 0 done")
 		default:
 			db.opt.Warningf("While forcing compaction on level 0: %v", err)
 		}
 	}
 
-	// Now close the value log.
-	if vlogErr := db.vlog.Close(); vlogErr != nil {
-		err = y.Wrap(vlogErr, "DB.Close")
-	}
-
-	db.opt.Infof(db.LevelsToString())
 	if lcErr := db.lc.close(); err == nil {
-		err = y.Wrap(lcErr, "DB.Close")
+		err = errors.Wrap(lcErr, "DB.Close")
 	}
 	db.opt.Debugf("Waiting for closer")
 	db.closers.updateSize.SignalAndWait()
 	db.orc.Stop()
 	db.blockCache.Close()
-	db.indexCache.Close()
-
-	db.threshold.close()
+	db.bfCache.Close()
 
 	if db.opt.InMemory {
 		return
@@ -630,29 +555,29 @@ func (db *DB) close() (err error) {
 
 	if db.dirLockGuard != nil {
 		if guardErr := db.dirLockGuard.release(); err == nil {
-			err = y.Wrap(guardErr, "DB.Close")
+			err = errors.Wrap(guardErr, "DB.Close")
 		}
 	}
 	if db.valueDirGuard != nil {
 		if guardErr := db.valueDirGuard.release(); err == nil {
-			err = y.Wrap(guardErr, "DB.Close")
+			err = errors.Wrap(guardErr, "DB.Close")
 		}
 	}
 	if manifestErr := db.manifest.close(); err == nil {
-		err = y.Wrap(manifestErr, "DB.Close")
+		err = errors.Wrap(manifestErr, "DB.Close")
 	}
 	if registryErr := db.registry.Close(); err == nil {
-		err = y.Wrap(registryErr, "DB.Close")
+		err = errors.Wrap(registryErr, "DB.Close")
 	}
 
 	// Fsync directories to ensure that lock file, and any other removed files whose directory
 	// we haven't specifically fsynced, are guaranteed to have their directory entry removal
 	// persisted to disk.
 	if syncErr := db.syncDir(db.opt.Dir); err == nil {
-		err = y.Wrap(syncErr, "DB.Close")
+		err = errors.Wrap(syncErr, "DB.Close")
 	}
 	if syncErr := db.syncDir(db.opt.ValueDir); err == nil {
-		err = y.Wrap(syncErr, "DB.Close")
+		err = errors.Wrap(syncErr, "DB.Close")
 	}
 
 	return err
@@ -671,59 +596,25 @@ const (
 // Sync syncs database content to disk. This function provides
 // more control to user to sync data whenever required.
 func (db *DB) Sync() error {
-	/**
-	Make an attempt to sync both the logs, the active memtable's WAL and the vLog (1847).
-	Cases:
-	- All_ok			:: If both the logs sync successfully.
-
-	- Entry_Lost		:: If an entry with a value pointer was present in the active memtable's WAL,
-						:: and the WAL was synced but there was an error in syncing the vLog.
-						:: The entry will be considered lost and this case will need to be handled during recovery.
-
-	- Entries_Lost		:: If there were errors in syncing both the logs, multiple entries would be lost.
-
-	- Entries_Lost      :: If the active memtable's WAL is not synced but the vLog is synced, it will
-						:: result in entries being lost because recovery of the active memtable is done from its WAL.
-						:: Check `UpdateSkipList` in memtable.go.
-
-	- Nothing_lost		:: If an entry with its value was present in the active memtable's WAL, and the WAL was synced,
-						:: but there was an error in syncing the vLog.
-						:: Nothing is lost for this very specific entry because the entry is completely present in the memtable's WAL.
-
-	- Partially_lost    :: If entries were written partially in either of the logs,
-						:: the logs will be truncated during recovery.
-						:: As a result of truncation, some entries might be lost.
-					    :: Assume that 4KB of data is to be synced and invoking `Sync` results only in syncing 3KB
-	                    :: of data and then the machine shuts down or the disk failure happens,
-						:: this will result in partial writes. [[This case needs verification]]
-	*/
-	db.lock.RLock()
-	memtableSyncError := db.mt.SyncWAL()
-	db.lock.RUnlock()
-
-	vLogSyncError := db.vlog.sync()
-	return y.CombineErrors(memtableSyncError, vLogSyncError)
+	return db.vlog.sync(math.MaxUint32)
 }
 
 // getMemtables returns the current memtables and get references.
-func (db *DB) getMemTables() ([]*memTable, func()) {
-	db.lock.RLock()
-	defer db.lock.RUnlock()
+func (db *DB) getMemTables() ([]*skl.Skiplist, func()) {
+	db.RLock()
+	defer db.RUnlock()
 
-	var tables []*memTable
+	tables := make([]*skl.Skiplist, len(db.imm)+1)
 
-	// Mutable memtable does not exist in read-only mode.
-	if !db.opt.ReadOnly {
-		// Get mutable memtable.
-		tables = append(tables, db.mt)
-		db.mt.IncrRef()
-	}
+	// Get mutable memtable.
+	tables[0] = db.mt
+	tables[0].IncrRef()
 
 	// Get immutable memtables.
 	last := len(db.imm) - 1
 	for i := range db.imm {
-		tables = append(tables, db.imm[last-i])
-		db.imm[last-i].IncrRef()
+		tables[i+1] = db.imm[last-i]
+		tables[i+1].IncrRef()
 	}
 	return tables, func() {
 		for _, tbl := range tables {
@@ -741,38 +632,63 @@ func (db *DB) getMemTables() ([]*memTable, func()) {
 // that all versions of a key are always present in the same table from level 1, because compaction
 // can push any table down.
 //
-// Update(23/09/2020) - We have dropped the move key implementation. Earlier we
-// were inserting move keys to fix the invalid value pointers but we no longer
-// do that. For every get("fooX") call where X is the version, we will search
-// for "fooX" in all the levels of the LSM tree. This is expensive but it
-// removes the overhead of handling move keys completely.
+// Update (Sep 22, 2018): To maintain the above invariant, and to allow keys to be moved from one
+// value log to another (while reclaiming space during value log GC), we have logically moved this
+// need to write "old versions after new versions" to the badgerMove keyspace. Thus, for normal
+// gets, we can stop going down the LSM tree once we find any version of the key (note however that
+// we will ALWAYS skip versions with ts greater than the key version).  However, if that key has
+// been moved, then for the corresponding movekey, we'll look through all the levels of the tree
+// to ensure that we pick the highest version of the movekey present.
 func (db *DB) get(key []byte) (y.ValueStruct, error) {
-	if db.IsClosed() {
-		return y.ValueStruct{}, ErrDBClosed
-	}
 	tables, decr := db.getMemTables() // Lock should be released.
 	defer decr()
 
-	var maxVs y.ValueStruct
-	version := y.ParseTs(key)
+	var maxVs *y.ValueStruct
+	var version uint64
+	if bytes.HasPrefix(key, badgerMove) {
+		// If we are checking badgerMove key, we should look into all the
+		// levels, so we can pick up the newer versions, which might have been
+		// compacted down the tree.
+		maxVs = &y.ValueStruct{}
+		version = y.ParseTs(key)
+	}
 
-	y.NumGetsAdd(db.opt.MetricsEnabled, 1)
+	y.NumGets.Add(1)
 	for i := 0; i < len(tables); i++ {
-		vs := tables[i].sl.Get(key)
-		y.NumMemtableGetsAdd(db.opt.MetricsEnabled, 1)
+		vs := tables[i].Get(key)
+		y.NumMemtableGets.Add(1)
 		if vs.Meta == 0 && vs.Value == nil {
 			continue
 		}
-		// Found the required version of the key, return immediately.
-		if vs.Version == version {
-			y.NumGetsWithResultsAdd(db.opt.MetricsEnabled, 1)
+		// Found a version of the key. For user keyspace, return immediately. For move keyspace,
+		// continue iterating, unless we found a version == given key version.
+		if maxVs == nil || vs.Version == version {
 			return vs, nil
 		}
 		if maxVs.Version < vs.Version {
-			maxVs = vs
+			*maxVs = vs
 		}
 	}
 	return db.lc.get(key, maxVs, 0)
+}
+
+// updateHead should not be called without the db.Lock() since db.vhead is used
+// by the writer go routines and memtable flushing goroutine.
+func (db *DB) updateHead(ptrs []valuePointer) {
+	var ptr valuePointer
+	for i := len(ptrs) - 1; i >= 0; i-- {
+		p := ptrs[i]
+		if !p.IsZero() {
+			ptr = p
+			break
+		}
+	}
+	if ptr.IsZero() {
+		return
+	}
+
+	y.AssertTrue(!ptr.Less(db.vhead))
+	db.vhead = ptr
 }
 
 var requestPool = sync.Pool{
@@ -781,19 +697,24 @@ var requestPool = sync.Pool{
 	},
 }
 
+func (db *DB) shouldWriteValueToLSM(e Entry) bool {
+	return len(e.Value) < db.opt.ValueThreshold
+}
+
 func (db *DB) writeToLSM(b *request) error {
 	// We should check the length of b.Prts and b.Entries only when badger is not
 	// running in InMemory mode. In InMemory mode, we don't write anything to the
 	// value log and that's why the length of b.Ptrs will always be zero.
 	if !db.opt.InMemory && len(b.Ptrs) != len(b.Entries) {
-		return fmt.Errorf("Ptrs and Entries don't match: %+v", b)
+		return errors.Errorf("Ptrs and Entries don't match: %+v", b)
 	}
 
 	for i, entry := range b.Entries {
-		var err error
-		if entry.skipVlogAndSetThreshold(db.valueThreshold()) {
-			// Will include deletion / tombstone case.
-			err = db.mt.Put(entry.Key,
+		if entry.meta&bitFinTxn != 0 {
+			continue
+		}
+		if db.shouldWriteValueToLSM(*entry) { // Will include deletion / tombstone case.
+			db.mt.Put(entry.Key,
 				y.ValueStruct{
 					Value: entry.Value,
 					// Ensure value pointer flag is removed. Otherwise, the value will fail
@@ -805,8 +726,7 @@ func (db *DB) writeToLSM(b *request) error {
 					ExpiresAt: entry.ExpiresAt,
 				})
 		} else {
-			// Write pointer to Memtable.
-			err = db.mt.Put(entry.Key,
+			db.mt.Put(entry.Key,
 				y.ValueStruct{
 					Value:     b.Ptrs[i].Encode(),
 					Meta:      entry.meta | bitValuePointer,
@@ -814,12 +734,6 @@ func (db *DB) writeToLSM(b *request) error {
 					ExpiresAt: entry.ExpiresAt,
 				})
 		}
-		if err != nil {
-			return y.Wrapf(err, "while writing to memTable")
-		}
-	}
-	if db.opt.SyncWrites {
-		return db.mt.SyncWAL()
 	}
 	return nil
 }
@@ -843,6 +757,8 @@ func (db *DB) writeRequests(reqs []*request) error {
 		return err
 	}
 
+	db.opt.Debugf("Sending updates to subscribers")
+	db.pub.sendUpdates(reqs)
 	db.opt.Debugf("Writing to memtable")
 	var count int
 	for _, b := range reqs {
@@ -851,7 +767,6 @@ func (db *DB) writeRequests(reqs []*request) error {
 		}
 		count += len(b.Entries)
 		var i uint64
-		var err error
 		for err = db.ensureRoomForWrite(); err == errNoRoom; err = db.ensureRoomForWrite() {
 			i++
 			if i%100 == 0 {
@@ -864,37 +779,35 @@ func (db *DB) writeRequests(reqs []*request) error {
 		}
 		if err != nil {
 			done(err)
-			return y.Wrap(err, "writeRequests")
+			return errors.Wrap(err, "writeRequests")
 		}
 		if err := db.writeToLSM(b); err != nil {
 			done(err)
-			return y.Wrap(err, "writeRequests")
+			return errors.Wrap(err, "writeRequests")
 		}
+		db.Lock()
+		db.updateHead(b.Ptrs)
+		db.Unlock()
 	}
-
-	db.opt.Debugf("Sending updates to subscribers")
-	db.pub.sendUpdates(reqs)
-
 	done(nil)
 	db.opt.Debugf("%d entries written", count)
 	return nil
 }
 
 func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
-	if db.blockWrites.Load() == 1 {
+	if atomic.LoadInt32(&db.blockWrites) == 1 {
 		return nil, ErrBlockedWrites
 	}
 	var count, size int64
 	for _, e := range entries {
-		size += e.estimateSizeAndSetThreshold(db.valueThreshold())
+		size += int64(e.estimateSize(db.opt.ValueThreshold))
 		count++
 	}
-	y.NumBytesWrittenUserAdd(db.opt.MetricsEnabled, size)
 	if count >= db.opt.maxBatchCount || size >= db.opt.maxBatchSize {
 		return nil, ErrTxnTooBig
 	}
 
-	// We can only service one request because we need each txn to be stored in a contiguous section.
+	// We can only service one request because we need each txn to be stored in a contigous section.
 	// Txns should not interleave among other txns or rewrites.
 	req := requestPool.Get().(*request)
 	req.reset()
@@ -902,12 +815,12 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 	req.Wg.Add(1)
 	req.IncrRef()     // for db write
 	db.writeCh <- req // Handled in doWrites.
-	y.NumPutsAdd(db.opt.MetricsEnabled, int64(len(entries)))
+	y.NumPuts.Add(int64(len(entries)))
 
 	return req, nil
 }
 
-func (db *DB) doWrites(lc *z.Closer) {
+func (db *DB) doWrites(lc *y.Closer) {
 	defer lc.Done()
 	pendingCh := make(chan struct{}, 1)
 
@@ -920,7 +833,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 
 	// This variable tracks the number of pending writes.
 	reqLen := new(expvar.Int)
-	y.PendingWritesSet(db.opt.MetricsEnabled, db.opt.Dir, reqLen)
+	y.PendingWrites.Set(db.opt.Dir, reqLen)
 
 	reqs := make([]*request, 0, 10)
 	for {
@@ -973,8 +886,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 
 // batchSet applies a list of badger.Entry. If a request level error occurs it
 // will be returned.
-//
-//	Check(kv.BatchSet(entries))
+//   Check(kv.BatchSet(entries))
 func (db *DB) batchSet(entries []*Entry) error {
 	req, err := db.sendToWriteCh(entries)
 	if err != nil {
@@ -987,10 +899,9 @@ func (db *DB) batchSet(entries []*Entry) error {
 // batchSetAsync is the asynchronous version of batchSet. It accepts a callback
 // function which is called when all the sets are complete. If a request level
 // error occurs, it will be passed back via the callback.
-//
-//	err := kv.BatchSetAsync(entries, func(err error)) {
-//	   Check(err)
-//	}
+//   err := kv.BatchSetAsync(entries, func(err error)) {
+//      Check(err)
+//   }
 func (db *DB) batchSetAsync(entries []*Entry, f func(error)) error {
 	req, err := db.sendToWriteCh(entries)
 	if err != nil {
@@ -1009,24 +920,42 @@ var errNoRoom = errors.New("No room for write")
 // ensureRoomForWrite is always called serially.
 func (db *DB) ensureRoomForWrite() error {
 	var err error
-	db.lock.Lock()
-	defer db.lock.Unlock()
+	db.Lock()
+	defer db.Unlock()
 
-	y.AssertTrue(db.mt != nil) // A nil mt indicates that DB is being closed.
-	if !db.mt.isFull() {
+	// Here we determine if we need to force flush memtable. Given we rotated log file, it would
+	// make sense to force flush a memtable, so the updated value head would have a chance to be
+	// pushed to L0. Otherwise, it would not go to L0, until the memtable has been fully filled,
+	// which can take a lot longer if the write load has fewer keys and larger values. This force
+	// flush, thus avoids the need to read through a lot of log files on a crash and restart.
+	// Above approach is quite simple with small drawback. We are calling ensureRoomForWrite before
+	// inserting every entry in Memtable. We will get latest db.head after all entries for a request
+	// are inserted in Memtable. If we have done >= db.logRotates rotations, then while inserting
+	// first entry in Memtable, below condition will be true and we will endup flushing old value of
+	// db.head. Hence we are limiting no of value log files to be read to db.logRotates only.
+	forceFlush := atomic.LoadInt32(&db.logRotates) >= db.opt.LogRotatesToFlush
+
+	if !forceFlush && db.mt.MemSize() < db.opt.MaxTableSize {
 		return nil
 	}
 
+	y.AssertTrue(db.mt != nil) // A nil mt indicates that DB is being closed.
 	select {
-	case db.flushChan <- db.mt:
+	case db.flushChan <- flushTask{mt: db.mt, vptr: db.vhead}:
+		// After every memtable flush, let's reset the counter.
+		atomic.StoreInt32(&db.logRotates, 0)
+
+		// Ensure value log is synced to disk so this memtable's contents wouldn't be lost.
+		err = db.vlog.sync(db.vhead.Fid)
+		if err != nil {
+			return err
+		}
+
 		db.opt.Debugf("Flushing memtable, mt.size=%d size of flushChan: %d\n",
-			db.mt.sl.MemSize(), len(db.flushChan))
+			db.mt.MemSize(), len(db.flushChan))
 		// We manage to push this task. Let's modify imm.
 		db.imm = append(db.imm, db.mt)
-		db.mt, err = db.newMemTable()
-		if err != nil {
-			return y.Wrapf(err, "cannot create new mem table")
-		}
+		db.mt = skl.NewSkiplist(arenaSize(db.opt))
 		// New memtable is empty. We certainly have room.
 		return nil
 	default:
@@ -1036,55 +965,95 @@ func (db *DB) ensureRoomForWrite() error {
 }
 
 func arenaSize(opt Options) int64 {
-	return opt.MemTableSize + opt.maxBatchSize + opt.maxBatchCount*int64(skl.MaxNodeSize)
+	return opt.MaxTableSize + opt.maxBatchSize + opt.maxBatchCount*int64(skl.MaxNodeSize)
 }
 
 // buildL0Table builds a new table from the memtable.
-func buildL0Table(iter y.Iterator, dropPrefixes [][]byte, bopts table.Options) *table.Builder {
+func buildL0Table(ft flushTask, bopts table.Options) []byte {
+	iter := ft.mt.NewIterator()
 	defer iter.Close()
-
 	b := table.NewTableBuilder(bopts)
-	for iter.Rewind(); iter.Valid(); iter.Next() {
-		if len(dropPrefixes) > 0 && hasAnyPrefixes(iter.Key(), dropPrefixes) {
+	defer b.Close()
+	var vp valuePointer
+	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
+		if len(ft.dropPrefixes) > 0 && hasAnyPrefixes(iter.Key(), ft.dropPrefixes) {
 			continue
 		}
 		vs := iter.Value()
-		var vp valuePointer
 		if vs.Meta&bitValuePointer > 0 {
 			vp.Decode(vs.Value)
 		}
 		b.Add(iter.Key(), iter.Value(), vp.Len)
 	}
-
-	return b
+	return b.Finish()
 }
 
-// handleMemTableFlush must be run serially.
-func (db *DB) handleMemTableFlush(mt *memTable, dropPrefixes [][]byte) error {
-	bopts := buildTableOptions(db)
-	itr := mt.sl.NewUniIterator(false)
-	builder := buildL0Table(itr, nil, bopts)
-	defer builder.Close()
+type flushTask struct {
+	mt           *skl.Skiplist
+	vptr         valuePointer
+	dropPrefixes [][]byte
+}
 
-	// buildL0Table can return nil if the none of the items in the skiplist are
-	// added to the builder. This can happen when drop prefix is set and all
-	// the items are skipped.
-	if builder.Empty() {
-		builder.Finish()
+// handleFlushTask must be run serially.
+func (db *DB) handleFlushTask(ft flushTask) error {
+	// There can be a scenario, when empty memtable is flushed. For example, memtable is empty and
+	// after writing request to value log, rotation count exceeds db.LogRotatesToFlush.
+	if ft.mt.Empty() {
 		return nil
 	}
 
-	fileID := db.lc.reserveFileID()
-	var tbl *table.Table
-	var err error
-	if db.opt.InMemory {
-		data := builder.Finish()
-		tbl, err = table.OpenInMemoryTable(data, fileID, &bopts)
-	} else {
-		tbl, err = table.CreateTable(table.NewFilename(fileID, db.opt.Dir), builder)
-	}
+	// Store badger head even if vptr is zero, need it for readTs
+	db.opt.Debugf("Storing value log head: %+v\n", ft.vptr)
+	db.opt.Debugf("Storing offset: %+v\n", ft.vptr)
+	val := ft.vptr.Encode()
+
+	// Pick the max commit ts, so in case of crash, our read ts would be higher than all the
+	// commits.
+	headTs := y.KeyWithTs(head, db.orc.nextTs())
+	ft.mt.Put(headTs, y.ValueStruct{Value: val})
+
+	dk, err := db.registry.latestDataKey()
 	if err != nil {
-		return y.Wrap(err, "error while creating table")
+		return y.Wrapf(err, "failed to get datakey in db.handleFlushTask")
+	}
+	bopts := buildTableOptions(db.opt)
+	bopts.DataKey = dk
+	// Builder does not need cache but the same options are used for opening table.
+	bopts.Cache = db.blockCache
+	bopts.BfCache = db.bfCache
+	tableData := buildL0Table(ft, bopts)
+
+	fileID := db.lc.reserveFileID()
+	if db.opt.KeepL0InMemory {
+		tbl, err := table.OpenInMemoryTable(tableData, fileID, &bopts)
+		if err != nil {
+			return errors.Wrapf(err, "failed to open table in memory")
+		}
+		return db.lc.addLevel0Table(tbl)
+	}
+
+	fd, err := y.CreateSyncedFile(table.NewFilename(fileID, db.opt.Dir), true)
+	if err != nil {
+		return y.Wrap(err)
+	}
+
+	// Don't block just to sync the directory entry.
+	dirSyncCh := make(chan error, 1)
+	go func() { dirSyncCh <- db.syncDir(db.opt.Dir) }()
+
+	if _, err = fd.Write(tableData); err != nil {
+		db.opt.Errorf("ERROR while writing to level 0: %v", err)
+		return err
+	}
+
+	if dirSyncErr := <-dirSyncCh; dirSyncErr != nil {
+		// Do dir sync as best effort. No need to return due to an error there.
+		db.opt.Errorf("ERROR while syncing level directory: %v", dirSyncErr)
+	}
+	tbl, err := table.OpenTable(fd, bopts)
+	if err != nil {
+		db.opt.Debugf("ERROR while opening table: %v", err)
+		return err
 	}
 	// We own a ref on tbl.
 	err = db.lc.addLevel0Table(tbl) // This will incrRef
@@ -1092,39 +1061,39 @@ func (db *DB) handleMemTableFlush(mt *memTable, dropPrefixes [][]byte) error {
 	return err
 }
 
-// flushMemtable must keep running until we send it an empty memtable. If there
-// are errors during handling the memtable flush, we'll retry indefinitely.
-func (db *DB) flushMemtable(lc *z.Closer) {
+// flushMemtable must keep running until we send it an empty flushTask. If there
+// are errors during handling the flush task, we'll retry indefinitely.
+func (db *DB) flushMemtable(lc *y.Closer) error {
 	defer lc.Done()
 
-	for mt := range db.flushChan {
-		if mt == nil {
+	for ft := range db.flushChan {
+		if ft.mt == nil {
+			// We close db.flushChan now, instead of sending a nil ft.mt.
 			continue
 		}
-
 		for {
-			if err := db.handleMemTableFlush(mt, nil); err != nil {
-				// Encountered error. Retry indefinitely.
-				db.opt.Errorf("error flushing memtable to disk: %v, retrying", err)
-				time.Sleep(time.Second)
-				continue
-			}
+			err := db.handleFlushTask(ft)
+			if err == nil {
+				// Update s.imm. Need a lock.
+				db.Lock()
+				// This is a single-threaded operation. ft.mt corresponds to the head of
+				// db.imm list. Once we flush it, we advance db.imm. The next ft.mt
+				// which would arrive here would match db.imm[0], because we acquire a
+				// lock over DB when pushing to flushChan.
+				// TODO: This logic is dirty AF. Any change and this could easily break.
+				y.AssertTrue(ft.mt == db.imm[0])
+				db.imm = db.imm[1:]
+				ft.mt.DecrRef() // Return memory.
+				db.Unlock()
 
-			// Update s.imm. Need a lock.
-			db.lock.Lock()
-			// This is a single-threaded operation. mt corresponds to the head of
-			// db.imm list. Once we flush it, we advance db.imm. The next mt
-			// which would arrive here would match db.imm[0], because we acquire a
-			// lock over DB when pushing to flushChan.
-			// TODO: This logic is dirty AF. Any change and this could easily break.
-			y.AssertTrue(mt == db.imm[0])
-			db.imm = db.imm[1:]
-			mt.DecrRef() // Return memory.
-			// unlock
-			db.lock.Unlock()
-			break
+				break
+			}
+			// Encountered error. Retry indefinitely.
+			db.opt.Errorf("Failure while flushing memtable to disk: %v. Retrying...\n", err)
+			time.Sleep(time.Second)
 		}
 	}
+	return nil
 }
 
 func exists(path string) (bool, error) {
@@ -1172,15 +1141,15 @@ func (db *DB) calculateSize() {
 	}
 
 	lsmSize, vlogSize := totalSize(db.opt.Dir)
-	y.LSMSizeSet(db.opt.MetricsEnabled, db.opt.Dir, newInt(lsmSize))
+	y.LSMSize.Set(db.opt.Dir, newInt(lsmSize))
 	// If valueDir is different from dir, we'd have to do another walk.
 	if db.opt.ValueDir != db.opt.Dir {
 		_, vlogSize = totalSize(db.opt.ValueDir)
 	}
-	y.VlogSizeSet(db.opt.MetricsEnabled, db.opt.ValueDir, newInt(vlogSize))
+	y.VlogSize.Set(db.opt.ValueDir, newInt(vlogSize))
 }
 
-func (db *DB) updateSize(lc *z.Closer) {
+func (db *DB) updateSize(lc *y.Closer) {
 	defer lc.Done()
 	if db.opt.InMemory {
 		return
@@ -1234,25 +1203,46 @@ func (db *DB) RunValueLogGC(discardRatio float64) error {
 		return ErrInvalidRequest
 	}
 
+	// startLevel is the level from which we should search for the head key. When badger is running
+	// with KeepL0InMemory flag, all tables on L0 are kept in memory. This means we should pick head
+	// key from Level 1 onwards because if we pick the headkey from Level 0 we might end up losing
+	// data. See test TestL0GCBug.
+	startLevel := 0
+	if db.opt.KeepL0InMemory {
+		startLevel = 1
+	}
+	// Find head on disk
+	headKey := y.KeyWithTs(head, math.MaxUint64)
+	// Need to pass with timestamp, lsm get removes the last 8 bytes and compares key
+	val, err := db.lc.get(headKey, nil, startLevel)
+	if err != nil {
+		return errors.Wrap(err, "Retrieving head from on-disk LSM")
+	}
+
+	var head valuePointer
+	if len(val.Value) > 0 {
+		head.Decode(val.Value)
+	}
+
 	// Pick a log file and run GC
-	return db.vlog.runGC(discardRatio)
+	return db.vlog.runGC(discardRatio, head)
 }
 
 // Size returns the size of lsm and value log files in bytes. It can be used to decide how often to
 // call RunValueLogGC.
 func (db *DB) Size() (lsm, vlog int64) {
-	if y.LSMSizeGet(db.opt.MetricsEnabled, db.opt.Dir) == nil {
+	if y.LSMSize.Get(db.opt.Dir) == nil {
 		lsm, vlog = 0, 0
 		return
 	}
-	lsm = y.LSMSizeGet(db.opt.MetricsEnabled, db.opt.Dir).(*expvar.Int).Value()
-	vlog = y.VlogSizeGet(db.opt.MetricsEnabled, db.opt.ValueDir).(*expvar.Int).Value()
+	lsm = y.LSMSize.Get(db.opt.Dir).(*expvar.Int).Value()
+	vlog = y.VlogSize.Get(db.opt.ValueDir).(*expvar.Int).Value()
 	return
 }
 
 // Sequence represents a Badger sequence.
 type Sequence struct {
-	lock      sync.Mutex
+	sync.Mutex
 	db        *DB
 	key       []byte
 	next      uint64
@@ -1263,8 +1253,8 @@ type Sequence struct {
 // Next would return the next integer in the sequence, updating the lease by running a transaction
 // if needed.
 func (seq *Sequence) Next() (uint64, error) {
-	seq.lock.Lock()
-	defer seq.lock.Unlock()
+	seq.Lock()
+	defer seq.Unlock()
 	if seq.next >= seq.leased {
 		if err := seq.updateLease(); err != nil {
 			return 0, err
@@ -1279,8 +1269,8 @@ func (seq *Sequence) Next() (uint64, error) {
 // before closing the associated DB. However it is valid to use the sequence after
 // it was released, causing a new lease with full bandwidth.
 func (seq *Sequence) Release() error {
-	seq.lock.Lock()
-	defer seq.lock.Unlock()
+	seq.Lock()
+	defer seq.Unlock()
 	err := seq.db.Update(func(txn *Txn) error {
 		item, err := txn.Get(seq.key)
 		if err != nil {
@@ -1370,142 +1360,24 @@ func (db *DB) GetSequence(key []byte, bandwidth uint64) (*Sequence, error) {
 
 // Tables gets the TableInfo objects from the level controller. If withKeysCount
 // is true, TableInfo objects also contain counts of keys for the tables.
-func (db *DB) Tables() []TableInfo {
-	return db.lc.getTableInfo()
+func (db *DB) Tables(withKeysCount bool) []TableInfo {
+	return db.lc.getTableInfo(withKeysCount)
 }
 
-// Levels gets the LevelInfo.
-func (db *DB) Levels() []LevelInfo {
-	return db.lc.getLevelInfo()
-}
-
-// EstimateSize can be used to get rough estimate of data size for a given prefix.
-func (db *DB) EstimateSize(prefix []byte) (uint64, uint64) {
-	var onDiskSize, uncompressedSize uint64
-	tables := db.Tables()
-	for _, ti := range tables {
-		if bytes.HasPrefix(ti.Left, prefix) && bytes.HasPrefix(ti.Right, prefix) {
-			onDiskSize += uint64(ti.OnDiskSize)
-			uncompressedSize += uint64(ti.UncompressedSize)
-		}
-	}
-	return onDiskSize, uncompressedSize
-}
-
-// Ranges can be used to get rough key ranges to divide up iteration over the DB. The ranges here
-// would consider the prefix, but would not necessarily start or end with the prefix. In fact, the
-// first range would have nil as left key, and the last range would have nil as the right key.
-func (db *DB) Ranges(prefix []byte, numRanges int) []*keyRange {
+// KeySplits can be used to get rough key ranges to divide up iteration over
+// the DB.
+func (db *DB) KeySplits(prefix []byte) []string {
 	var splits []string
-	tables := db.Tables()
-
 	// We just want table ranges here and not keys count.
-	for _, ti := range tables {
-		// We don't use ti.Left, because that has a tendency to store !badger keys. Skip over tables
-		// at upper levels. Only choose tables from the last level.
-		if ti.Level != db.opt.MaxLevels-1 {
-			continue
-		}
+	for _, ti := range db.Tables(false) {
+		// We don't use ti.Left, because that has a tendency to store !badger
+		// keys.
 		if bytes.HasPrefix(ti.Right, prefix) {
 			splits = append(splits, string(ti.Right))
 		}
 	}
-
-	// If the number of splits is low, look at the offsets inside the
-	// tables to generate more splits.
-	if len(splits) < 32 {
-		numTables := len(tables)
-		if numTables == 0 {
-			numTables = 1
-		}
-		numPerTable := 32 / numTables
-		if numPerTable == 0 {
-			numPerTable = 1
-		}
-		splits = db.lc.keySplits(numPerTable, prefix)
-	}
-
-	// If the number of splits is still < 32, then look at the memtables.
-	if len(splits) < 32 {
-		maxPerSplit := 10000
-		mtSplits := func(mt *memTable) {
-			if mt == nil {
-				return
-			}
-			count := 0
-			iter := mt.sl.NewIterator()
-			for iter.SeekToFirst(); iter.Valid(); iter.Next() {
-				if count%maxPerSplit == 0 {
-					// Add a split every maxPerSplit keys.
-					if bytes.HasPrefix(iter.Key(), prefix) {
-						splits = append(splits, string(iter.Key()))
-					}
-				}
-				count += 1
-			}
-			_ = iter.Close()
-		}
-
-		db.lock.Lock()
-		defer db.lock.Unlock()
-		var memTables []*memTable
-		memTables = append(memTables, db.imm...)
-		for _, mt := range memTables {
-			mtSplits(mt)
-		}
-		mtSplits(db.mt)
-	}
-
-	// We have our splits now. Let's convert them to ranges.
 	sort.Strings(splits)
-	var ranges []*keyRange
-	var start []byte
-	for _, key := range splits {
-		ranges = append(ranges, &keyRange{left: start, right: y.SafeCopy(nil, []byte(key))})
-		start = y.SafeCopy(nil, []byte(key))
-	}
-	ranges = append(ranges, &keyRange{left: start})
-
-	// Figure out the approximate table size this range has to deal with.
-	for _, t := range tables {
-		tr := keyRange{left: t.Left, right: t.Right}
-		for _, r := range ranges {
-			if len(r.left) == 0 || len(r.right) == 0 {
-				continue
-			}
-			if r.overlapsWith(tr) {
-				r.size += int64(t.UncompressedSize)
-			}
-		}
-	}
-
-	var total int64
-	for _, r := range ranges {
-		total += r.size
-	}
-	if total == 0 {
-		return ranges
-	}
-	// Figure out the average size, so we know how to bin the ranges together.
-	avg := total / int64(numRanges)
-
-	var out []*keyRange
-	var i int
-	for i < len(ranges) {
-		r := ranges[i]
-		cur := &keyRange{left: r.left, size: r.size, right: r.right}
-		i++
-		for ; i < len(ranges); i++ {
-			next := ranges[i]
-			if cur.size+next.size > avg {
-				break
-			}
-			cur.right = next.right
-			cur.size += next.size
-		}
-		out = append(out, cur)
-	}
-	return out
+	return splits
 }
 
 // MaxBatchCount returns max possible entries in batch
@@ -1536,7 +1408,7 @@ func (db *DB) stopCompactions() {
 func (db *DB) startCompactions() {
 	// Resume compactions.
 	if db.closers.compactors != nil {
-		db.closers.compactors = z.NewCloser(1)
+		db.closers.compactors = y.NewCloser(1)
 		db.lc.startCompact(db.closers.compactors)
 	}
 }
@@ -1544,10 +1416,10 @@ func (db *DB) startCompactions() {
 func (db *DB) startMemoryFlush() {
 	// Start memory fluhser.
 	if db.closers.memtable != nil {
-		db.flushChan = make(chan *memTable, db.opt.NumMemtables)
-		db.closers.memtable = z.NewCloser(1)
+		db.flushChan = make(chan flushTask, db.opt.NumMemtables)
+		db.closers.memtable = y.NewCloser(1)
 		go func() {
-			db.flushMemtable(db.closers.memtable)
+			_ = db.flushMemtable(db.closers.memtable)
 		}()
 	}
 }
@@ -1558,7 +1430,6 @@ func (db *DB) startMemoryFlush() {
 // stopped. Ideally, no writes are going on during Flatten. Otherwise, it would create competition
 // between flattening the tree and new tables being created at level zero.
 func (db *DB) Flatten(workers int) error {
-
 	db.stopCompactions()
 	defer db.startCompactions()
 
@@ -1567,7 +1438,7 @@ func (db *DB) Flatten(workers int) error {
 		errCh := make(chan error, 1)
 		for i := 0; i < workers; i++ {
 			go func() {
-				errCh <- db.lc.doCompact(175, cp)
+				errCh <- db.lc.doCompact(cp)
 			}()
 		}
 		var success int
@@ -1591,23 +1462,22 @@ func (db *DB) Flatten(workers int) error {
 	}
 
 	hbytes := func(sz int64) string {
-		return humanize.IBytes(uint64(sz))
+		return humanize.Bytes(uint64(sz))
 	}
 
-	t := db.lc.levelTargets()
 	for {
 		db.opt.Infof("\n")
 		var levels []int
 		for i, l := range db.lc.levels {
 			sz := l.getTotalSize()
 			db.opt.Infof("Level: %d. %8s Size. %8s Max.\n",
-				i, hbytes(l.getTotalSize()), hbytes(t.targetSz[i]))
+				i, hbytes(l.getTotalSize()), hbytes(l.maxTotalSize))
 			if sz > 0 {
 				levels = append(levels, i)
 			}
 		}
 		if len(levels) <= 1 {
-			prios := db.lc.pickCompactLevels(nil)
+			prios := db.lc.pickCompactLevels()
 			if len(prios) == 0 || prios[0].score <= 1.0 {
 				db.opt.Infof("All tables consolidated into one level. Flattening done.\n")
 				return nil
@@ -1627,7 +1497,7 @@ func (db *DB) Flatten(workers int) error {
 
 func (db *DB) blockWrite() error {
 	// Stop accepting new writes.
-	if !db.blockWrites.CompareAndSwap(0, 1) {
+	if !atomic.CompareAndSwapInt32(&db.blockWrites, 0, 1) {
 		return ErrBlockedWrites
 	}
 
@@ -1638,11 +1508,11 @@ func (db *DB) blockWrite() error {
 }
 
 func (db *DB) unblockWrite() {
-	db.closers.writes = z.NewCloser(1)
+	db.closers.writes = y.NewCloser(1)
 	go db.doWrites(db.closers.writes)
 
 	// Resume writes.
-	db.blockWrites.Store(0)
+	atomic.StoreInt32(&db.blockWrites, 0)
 }
 
 func (db *DB) prepareToDrop() (func(), error) {
@@ -1650,10 +1520,10 @@ func (db *DB) prepareToDrop() (func(), error) {
 		panic("Attempting to drop data in read-only mode.")
 	}
 	// In order prepare for drop, we need to block the incoming writes and
-	// write it to db. Then, flush all the pending memtable. So that, we
+	// write it to db. Then, flush all the pending flushtask. So that, we
 	// don't miss any entries.
 	if err := db.blockWrite(); err != nil {
-		return func() {}, err
+		return nil, err
 	}
 	reqs := make([]*request, 0, 10)
 	for {
@@ -1699,8 +1569,8 @@ func (db *DB) dropAll() (func(), error) {
 	if err != nil {
 		return f, err
 	}
-	// prepareToDrop will stop all the incoming write and flushes any pending memtables.
-	// Before we drop, we'll stop the compaction because anyways all the data are going to
+	// prepareToDrop will stop all the incomming write and flushes any pending flush tasks.
+	// Before we drop, we'll stop the compaction because anyways all the datas are going to
 	// be deleted.
 	db.stopCompactions()
 	resume := func() {
@@ -1708,8 +1578,8 @@ func (db *DB) dropAll() (func(), error) {
 		f()
 	}
 	// Block all foreign interactions with memory tables.
-	db.lock.Lock()
-	defer db.lock.Unlock()
+	db.Lock()
+	defer db.Unlock()
 
 	// Remove inmemory tables. Calling DecrRef for safety. Not sure if they're absolutely needed.
 	db.mt.DecrRef()
@@ -1717,10 +1587,7 @@ func (db *DB) dropAll() (func(), error) {
 		mt.DecrRef()
 	}
 	db.imm = db.imm[:0]
-	db.mt, err = db.newMemTable() // Set it up for future writes.
-	if err != nil {
-		return resume, y.Wrapf(err, "cannot open new memtable")
-	}
+	db.mt = skl.NewSkiplist(arenaSize(db.opt)) // Set it up for future writes.
 
 	num, err := db.lc.dropTree()
 	if err != nil {
@@ -1732,57 +1599,51 @@ func (db *DB) dropAll() (func(), error) {
 	if err != nil {
 		return resume, err
 	}
-	db.lc.nextFileID.Store(1)
+	db.vhead = valuePointer{} // Zero it out.
+	db.lc.nextFileID = 1
 	db.opt.Infof("Deleted %d value log files. DropAll done.\n", num)
 	db.blockCache.Clear()
-	db.indexCache.Clear()
-	db.threshold.Clear(db.opt)
+	db.bfCache.Clear()
+
 	return resume, nil
 }
 
 // DropPrefix would drop all the keys with the provided prefix. It does this in the following way:
-//   - Stop accepting new writes.
-//   - Stop memtable flushes before acquiring lock. Because we're acquiring lock here
-//     and memtable flush stalls for lock, which leads to deadlock
-//   - Flush out all memtables, skipping over keys with the given prefix, Kp.
-//   - Write out the value log header to memtables when flushing, so we don't accidentally bring Kp
-//     back after a restart.
-//   - Stop compaction.
-//   - Compact L0->L1, skipping over Kp.
-//   - Compact rest of the levels, Li->Li, picking tables which have Kp.
-//   - Resume memtable flushes, compactions and writes.
+// - Stop accepting new writes.
+// - Stop memtable flushes before acquiring lock. Because we're acquring lock here
+//   and memtable flush stalls for lock, which leads to deadlock
+// - Flush out all memtables, skipping over keys with the given prefix, Kp.
+// - Write out the value log header to memtables when flushing, so we don't accidentally bring Kp
+//   back after a restart.
+// - Stop compaction.
+// - Compact L0->L1, skipping over Kp.
+// - Compact rest of the levels, Li->Li, picking tables which have Kp.
+// - Resume memtable flushes, compactions and writes.
 func (db *DB) DropPrefix(prefixes ...[]byte) error {
-	if len(prefixes) == 0 {
-		return nil
-	}
-	db.opt.Infof("DropPrefix called for %s", prefixes)
+	db.opt.Infof("DropPrefix Called")
 	f, err := db.prepareToDrop()
 	if err != nil {
 		return err
 	}
 	defer f()
-
-	var filtered [][]byte
-	if filtered, err = db.filterPrefixesToDrop(prefixes); err != nil {
-		return err
-	}
-	// If there is no prefix for which the data already exist, do not do anything.
-	if len(filtered) == 0 {
-		db.opt.Infof("No prefixes to drop")
-		return nil
-	}
 	// Block all foreign interactions with memory tables.
-	db.lock.Lock()
-	defer db.lock.Unlock()
+	db.Lock()
+	defer db.Unlock()
 
 	db.imm = append(db.imm, db.mt)
 	for _, memtable := range db.imm {
-		if memtable.sl.Empty() {
+		if memtable.Empty() {
 			memtable.DecrRef()
 			continue
 		}
+		task := flushTask{
+			mt: memtable,
+			// Ensure that the head of value log gets persisted to disk.
+			vptr:         db.vhead,
+			dropPrefixes: prefixes,
+		}
 		db.opt.Debugf("Flushing memtable")
-		if err := db.handleMemTableFlush(memtable, filtered); err != nil {
+		if err := db.handleFlushTask(task); err != nil {
 			db.opt.Errorf("While trying to flush memtable: %v", err)
 			return err
 		}
@@ -1791,129 +1652,42 @@ func (db *DB) DropPrefix(prefixes ...[]byte) error {
 	db.stopCompactions()
 	defer db.startCompactions()
 	db.imm = db.imm[:0]
-	db.mt, err = db.newMemTable()
-	if err != nil {
-		return y.Wrapf(err, "cannot create new mem table")
-	}
+	db.mt = skl.NewSkiplist(arenaSize(db.opt))
 
 	// Drop prefixes from the levels.
-	if err := db.lc.dropPrefixes(filtered); err != nil {
+	if err := db.lc.dropPrefixes(prefixes); err != nil {
 		return err
 	}
 	db.opt.Infof("DropPrefix done")
 	return nil
 }
 
-func (db *DB) filterPrefixesToDrop(prefixes [][]byte) ([][]byte, error) {
-	var filtered [][]byte
-	for _, prefix := range prefixes {
-		err := db.View(func(txn *Txn) error {
-			iopts := DefaultIteratorOptions
-			iopts.Prefix = prefix
-			iopts.PrefetchValues = false
-			itr := txn.NewIterator(iopts)
-			defer itr.Close()
-			itr.Rewind()
-			if itr.ValidForPrefix(prefix) {
-				filtered = append(filtered, prefix)
-			}
-			return nil
-		})
-		if err != nil {
-			return filtered, err
-		}
-	}
-	return filtered, nil
-}
-
-// Checks if the key is banned. Returns the respective error if the key belongs to any of the banned
-// namepspaces. Else it returns nil.
-func (db *DB) isBanned(key []byte) error {
-	if db.opt.NamespaceOffset < 0 {
-		return nil
-	}
-	if len(key) <= db.opt.NamespaceOffset+8 {
-		return nil
-	}
-	if db.bannedNamespaces.has(y.BytesToU64(key[db.opt.NamespaceOffset:])) {
-		return ErrBannedKey
-	}
-	return nil
-}
-
-// BanNamespace bans a namespace. Read/write to keys belonging to any of such namespace is denied.
-func (db *DB) BanNamespace(ns uint64) error {
-	if db.opt.NamespaceOffset < 0 {
-		return ErrNamespaceMode
-	}
-	db.opt.Infof("Banning namespace: %d", ns)
-	// First set the banned namespaces in DB and then update the in-memory structure.
-	key := y.KeyWithTs(append(bannedNsKey, y.U64ToBytes(ns)...), 1)
-	entry := []*Entry{{
-		Key:   key,
-		Value: nil,
-	}}
-	req, err := db.sendToWriteCh(entry)
-	if err != nil {
-		return err
-	}
-	if err := req.Wait(); err != nil {
-		return err
-	}
-	db.bannedNamespaces.add(ns)
-	return nil
-}
-
-// BannedNamespaces returns the list of prefixes banned for DB.
-func (db *DB) BannedNamespaces() []uint64 {
-	return db.bannedNamespaces.all()
-}
-
 // KVList contains a list of key-value pairs.
 type KVList = pb.KVList
 
-// Subscribe can be used to watch key changes for the given key prefixes and the ignore string.
+// Subscribe can be used to watch key changes for the given key prefixes.
 // At least one prefix should be passed, or an error will be returned.
 // You can use an empty prefix to monitor all changes to the DB.
-// Ignore string is the byte ranges for which prefix matching will be ignored.
-// For example: ignore = "2-3", and prefix = "abc" will match for keys "abxxc", "abdfc" etc.
 // This function blocks until the given context is done or an error occurs.
 // The given function will be called with a new KVList containing the modified keys and the
 // corresponding values.
-func (db *DB) Subscribe(ctx context.Context, cb func(kv *KVList) error, matches []pb.Match) error {
+func (db *DB) Subscribe(ctx context.Context, cb func(kv *KVList) error, prefixes ...[]byte) error {
 	if cb == nil {
 		return ErrNilCallback
 	}
 
-	c := z.NewCloser(1)
-	s, err := db.pub.newSubscriber(c, matches)
-	if err != nil {
-		return y.Wrapf(err, "while creating a new subscriber")
-	}
+	c := y.NewCloser(1)
+	recvCh, id := db.pub.newSubscriber(c, prefixes...)
 	slurp := func(batch *pb.KVList) error {
 		for {
 			select {
-			case kvs := <-s.sendCh:
+			case kvs := <-recvCh:
 				batch.Kv = append(batch.Kv, kvs.Kv...)
 			default:
 				if len(batch.GetKv()) > 0 {
 					return cb(batch)
 				}
 				return nil
-			}
-		}
-	}
-
-	drain := func() {
-		for {
-			select {
-			case _, ok := <-s.sendCh:
-				if !ok {
-					// Channel is closed.
-					return
-				}
-			default:
-				return
 			}
 		}
 	}
@@ -1928,23 +1702,24 @@ func (db *DB) Subscribe(ctx context.Context, cb func(kv *KVList) error, matches 
 			return err
 		case <-ctx.Done():
 			c.Done()
-			s.active.Store(0)
-			drain()
-			db.pub.deleteSubscriber(s.id)
+			db.pub.deleteSubscriber(id)
 			// Delete the subscriber to avoid further updates.
 			return ctx.Err()
-		case batch := <-s.sendCh:
+		case batch := <-recvCh:
 			err := slurp(batch)
 			if err != nil {
 				c.Done()
-				s.active.Store(0)
-				drain()
 				// Delete the subscriber if there is an error by the callback.
-				db.pub.deleteSubscriber(s.id)
+				db.pub.deleteSubscriber(id)
 				return err
 			}
 		}
 	}
+}
+
+// shouldEncrypt returns bool, which tells whether to encrypt or not.
+func (db *DB) shouldEncrypt() bool {
+	return len(db.opt.EncryptionKey) > 0
 }
 
 func (db *DB) syncDir(dir string) error {
@@ -1962,116 +1737,14 @@ func createDirs(opt Options) error {
 		}
 		if !dirExists {
 			if opt.ReadOnly {
-				return fmt.Errorf("Cannot find directory %q for read-only open", path)
+				return errors.Errorf("Cannot find directory %q for read-only open", path)
 			}
 			// Try to create the directory
-			err = os.MkdirAll(path, 0700)
+			err = os.Mkdir(path, 0700)
 			if err != nil {
 				return y.Wrapf(err, "Error Creating Dir: %q", path)
 			}
 		}
 	}
 	return nil
-}
-
-// Stream the contents of this DB to a new DB with options outOptions that will be
-// created in outDir.
-func (db *DB) StreamDB(outOptions Options) error {
-	outDir := outOptions.Dir
-
-	// Open output DB.
-	outDB, err := OpenManaged(outOptions)
-	if err != nil {
-		return y.Wrapf(err, "cannot open out DB at %s", outDir)
-	}
-	defer outDB.Close()
-	writer := outDB.NewStreamWriter()
-	if err := writer.Prepare(); err != nil {
-		return y.Wrapf(err, "cannot create stream writer in out DB at %s", outDir)
-	}
-
-	// Stream contents of DB to the output DB.
-	stream := db.NewStreamAt(math.MaxUint64)
-	stream.LogPrefix = fmt.Sprintf("Streaming DB to new DB at %s", outDir)
-
-	stream.Send = func(buf *z.Buffer) error {
-		return writer.Write(buf)
-	}
-	if err := stream.Orchestrate(context.Background()); err != nil {
-		return y.Wrapf(err, "cannot stream DB to out DB at %s", outDir)
-	}
-	if err := writer.Flush(); err != nil {
-		return y.Wrapf(err, "cannot flush writer")
-	}
-	return nil
-}
-
-// Opts returns a copy of the DB options.
-func (db *DB) Opts() Options {
-	return db.opt
-}
-
-type CacheType int
-
-const (
-	BlockCache CacheType = iota
-	IndexCache
-)
-
-// CacheMaxCost updates the max cost of the given cache (either block or index cache).
-// The call will have an effect only if the DB was created with the cache. Otherwise it is
-// a no-op. If you pass a negative value, the function will return the current value
-// without updating it.
-func (db *DB) CacheMaxCost(cache CacheType, maxCost int64) (int64, error) {
-	if db == nil {
-		return 0, nil
-	}
-
-	if maxCost < 0 {
-		switch cache {
-		case BlockCache:
-			return db.blockCache.MaxCost(), nil
-		case IndexCache:
-			return db.indexCache.MaxCost(), nil
-		default:
-			return 0, errors.New("invalid cache type")
-		}
-	}
-
-	switch cache {
-	case BlockCache:
-		db.blockCache.UpdateMaxCost(maxCost)
-		return maxCost, nil
-	case IndexCache:
-		db.indexCache.UpdateMaxCost(maxCost)
-		return maxCost, nil
-	default:
-		return 0, errors.New("invalid cache type")
-	}
-}
-
-func (db *DB) LevelsToString() string {
-	levels := db.Levels()
-	h := func(sz int64) string {
-		return humanize.IBytes(uint64(sz))
-	}
-	base := func(b bool) string {
-		if b {
-			return "B"
-		}
-		return " "
-	}
-
-	var b strings.Builder
-	b.WriteRune('\n')
-	for _, li := range levels {
-		b.WriteString(fmt.Sprintf(
-			"Level %d [%s]: NumTables: %02d. Size: %s of %s. Score: %.2f->%.2f"+
-				" StaleData: %s Target FileSize: %s\n",
-			li.Level, base(li.IsBaseLevel), li.NumTables,
-			h(li.Size), h(li.TargetSize), li.Score, li.Adjusted, h(li.StaleDatSize),
-			h(li.TargetFileSize)))
-	}
-	b.WriteString("Level Done\n")
-	return b.String()
 }

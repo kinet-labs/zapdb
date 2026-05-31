@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2019 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
@@ -61,11 +72,11 @@ type header struct {
 
 const (
 	// Maximum possible size of the header. The maximum size of header struct will be 18 but the
-	// maximum size of varint encoded header will be 22.
-	maxHeaderSize = 22
+	// maximum size of varint encoded header will be 21.
+	maxHeaderSize = 21
 )
 
-// Encode encodes the header into []byte. The provided []byte should be at least 5 bytes. The
+// Encode encodes the header into []byte. The provided []byte should be atleast 5 bytes. The
 // function will panic if out []byte isn't large enough to hold all the values.
 // The encoded header looks like
 // +------+----------+------------+--------------+-----------+
@@ -129,41 +140,24 @@ func (h *header) DecodeFrom(reader *hashReader) (int, error) {
 type Entry struct {
 	Key       []byte
 	Value     []byte
-	ExpiresAt uint64 // time.Unix
-	version   uint64
-	offset    uint32 // offset is an internal field.
 	UserMeta  byte
+	ExpiresAt uint64 // time.Unix
 	meta      byte
+	version   uint64
 
 	// Fields maintained internally.
-	hlen         int // Length of the header.
-	valThreshold int64
+	offset   uint32
+	skipVlog bool
+	hlen     int // Length of the header.
 }
 
-func (e *Entry) isZero() bool {
-	return len(e.Key) == 0
-}
-
-func (e *Entry) estimateSizeAndSetThreshold(threshold int64) int64 {
-	if e.valThreshold == 0 {
-		e.valThreshold = threshold
+func (e *Entry) estimateSize(threshold int) int {
+	if len(e.Value) < threshold {
+		return len(e.Key) + len(e.Value) + 2 // Meta, UserMeta
 	}
-	k := int64(len(e.Key))
-	v := int64(len(e.Value))
-	if v < e.valThreshold {
-		return k + v + 2 // Meta, UserMeta
-	}
-	return k + 12 + 2 // 12 for ValuePointer, 2 for metas.
+	return len(e.Key) + 12 + 2 // 12 for ValuePointer, 2 for metas.
 }
 
-func (e *Entry) skipVlogAndSetThreshold(threshold int64) bool {
-	if e.valThreshold == 0 {
-		e.valThreshold = threshold
-	}
-	return int64(len(e.Value)) < e.valThreshold
-}
-
-//nolint:unused
 func (e Entry) print(prefix string) {
 	fmt.Printf("%s Key: %s Meta: %d UserMeta: %d Offset: %d len(val)=%d",
 		prefix, e.Key, e.meta, e.UserMeta, e.offset, len(e.Value))

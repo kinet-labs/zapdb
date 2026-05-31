@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
@@ -9,16 +20,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
-	"errors"
-	"fmt"
 	"math"
 	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
 
-	"github.com/kinet-labs/zapdb/y"
-	"github.com/dgraph-io/ristretto/v2/z"
+	"github.com/dgraph-io/badger/v2/y"
+	"github.com/dgraph-io/ristretto/z"
+	"github.com/pkg/errors"
 )
 
 type oracle struct {
@@ -45,7 +55,7 @@ type oracle struct {
 	lastCleanupTs uint64
 
 	// closer is used to stop watermarks.
-	closer *z.Closer
+	closer *y.Closer
 }
 
 type committedTxn struct {
@@ -64,7 +74,7 @@ func newOracle(opt Options) *oracle {
 		// See https://golang.org/pkg/sync/atomic/#pkg-note-BUG.
 		readMark: &y.WaterMark{Name: "badger.PendingReads"},
 		txnMark:  &y.WaterMark{Name: "badger.TxnTimestamp"},
-		closer:   z.NewCloser(2),
+		closer:   y.NewCloser(2),
 	}
 	orc.readMark.Init(orc.closer)
 	orc.txnMark.Init(orc.closer)
@@ -150,12 +160,12 @@ func (o *oracle) hasConflict(txn *Txn) bool {
 	return false
 }
 
-func (o *oracle) newCommitTs(txn *Txn) (uint64, bool) {
+func (o *oracle) newCommitTs(txn *Txn) uint64 {
 	o.Lock()
 	defer o.Unlock()
 
 	if o.hasConflict(txn) {
-		return 0, true
+		return 0
 	}
 
 	var ts uint64
@@ -184,7 +194,7 @@ func (o *oracle) newCommitTs(txn *Txn) (uint64, bool) {
 		})
 	}
 
-	return ts, false
+	return ts
 }
 
 func (o *oracle) doneRead(txn *Txn) {
@@ -239,11 +249,9 @@ func (o *oracle) doneCommit(cts uint64) {
 type Txn struct {
 	readTs   uint64
 	commitTs uint64
-	size     int64
-	count    int64
-	db       *DB
 
-	reads []uint64 // contains fingerprints of keys read.
+	update bool     // update is used to conditionally keep track of reads.
+	reads  []uint64 // contains fingerprints of keys read.
 	// contains fingerprints of keys written. This is used for conflict detection.
 	conflictKeys map[uint64]struct{}
 	readsLock    sync.Mutex // guards the reads slice. See addReadKey.
@@ -251,10 +259,13 @@ type Txn struct {
 	pendingWrites   map[string]*Entry // cache stores any writes done by txn.
 	duplicateWrites []*Entry          // Used in managed mode to store duplicate entries.
 
-	numIterators atomic.Int32
-	discarded    bool
-	doneRead     bool
-	update       bool // update is used to conditionally keep track of reads.
+	db        *DB
+	discarded bool
+	doneRead  bool
+
+	size         int64
+	count        int64
+	numIterators int32
 }
 
 type pendingWritesIterator struct {
@@ -335,7 +346,7 @@ func (txn *Txn) newPendingWritesIterator(reversed bool) *pendingWritesIterator {
 func (txn *Txn) checkSize(e *Entry) error {
 	count := txn.count + 1
 	// Extra bytes for the version in key.
-	size := txn.size + e.estimateSizeAndSetThreshold(txn.db.valueThreshold()) + 10
+	size := txn.size + int64(e.estimateSize(txn.db.opt.ValueThreshold)) + 10
 	if count >= txn.db.opt.maxBatchCount || size >= txn.db.opt.maxBatchSize {
 		return ErrTxnTooBig
 	}
@@ -344,7 +355,7 @@ func (txn *Txn) checkSize(e *Entry) error {
 }
 
 func exceedsSize(prefix string, max int64, key []byte) error {
-	return fmt.Errorf("%s with size %d exceeded %d limit. %s:\n%s",
+	return errors.Errorf("%s with size %d exceeded %d limit. %s:\n%s",
 		prefix, len(key), max, prefix, hex.Dump(key[:1<<10]))
 }
 
@@ -367,12 +378,8 @@ func (txn *Txn) modify(e *Entry) error {
 		return exceedsSize("Key", maxKeySize, e.Key)
 	case int64(len(e.Value)) > txn.db.opt.ValueLogFileSize:
 		return exceedsSize("Value", txn.db.opt.ValueLogFileSize, e.Value)
-	case txn.db.opt.InMemory && int64(len(e.Value)) > txn.db.valueThreshold():
-		return exceedsSize("Value", txn.db.valueThreshold(), e.Value)
-	}
-
-	if err := txn.db.isBanned(e.Key); err != nil {
-		return err
+	case txn.db.opt.InMemory && len(e.Value) > txn.db.opt.ValueThreshold:
+		return exceedsSize("Value", int64(txn.db.opt.ValueThreshold), e.Value)
 	}
 
 	if err := txn.checkSize(e); err != nil {
@@ -438,10 +445,6 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 		return nil, ErrDiscardedTxn
 	}
 
-	if err := txn.db.isBanned(key); err != nil {
-		return nil, err
-	}
-
 	item = new(Item)
 	if txn.update {
 		if e, has := txn.pendingWrites[string(key)]; has && bytes.Equal(key, e.Key) {
@@ -467,7 +470,7 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 	seek := y.KeyWithTs(key, txn.readTs)
 	vs, err := txn.db.get(seek)
 	if err != nil {
-		return nil, y.Wrapf(err, "DB::Get key: %q", key)
+		return nil, errors.Wrapf(err, "DB::Get key: %q", key)
 	}
 	if vs.Value == nil && vs.Meta == 0 {
 		return nil, ErrKeyNotFound
@@ -480,6 +483,7 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 	item.version = vs.Version
 	item.meta = vs.Meta
 	item.userMeta = vs.UserMeta
+	item.db = txn.db
 	item.vptr = y.SafeCopy(item.vptr, vs.Value)
 	item.txn = txn
 	item.expiresAt = vs.ExpiresAt
@@ -509,7 +513,7 @@ func (txn *Txn) Discard() {
 	if txn.discarded { // Avoid a re-run.
 		return
 	}
-	if txn.numIterators.Load() > 0 {
+	if atomic.LoadInt32(&txn.numIterators) > 0 {
 		panic("Unclosed iterator at time of Txn.Discard.")
 	}
 	txn.discarded = true
@@ -527,8 +531,10 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 	orc.writeChLock.Lock()
 	defer orc.writeChLock.Unlock()
 
-	commitTs, conflict := orc.newCommitTs(txn)
-	if conflict {
+	commitTs := orc.newCommitTs(txn)
+	// The commitTs can be zero if the transaction is running in managed mode.
+	// Individual entries might have their own timestamps.
+	if commitTs == 0 && !txn.db.opt.managedTxns {
 		return nil, ErrConflict
 	}
 
@@ -650,9 +656,7 @@ func (txn *Txn) Commit() error {
 	// txn.conflictKeys can be zero if conflict detection is turned off. So we
 	// should check txn.pendingWrites.
 	if len(txn.pendingWrites) == 0 {
-		// Discard the transaction so that the read is marked done.
-		txn.Discard()
-		return nil
+		return nil // Nothing to do.
 	}
 	// Precheck before discarding txn.
 	if err := txn.commitPrecheck(); err != nil {
@@ -707,8 +711,6 @@ func (txn *Txn) CommitWith(cb func(error)) {
 		// callback might be acquiring the same locks. Instead run the callback
 		// from another goroutine.
 		go runTxnCallback(&txnCb{user: cb, err: nil})
-		// Discard the transaction so that the read is marked done.
-		txn.Discard()
 		return
 	}
 
@@ -751,9 +753,9 @@ func (txn *Txn) ReadTs() uint64 {
 // to. Commit API internally runs Discard, but running it twice wouldn't cause
 // any issues.
 //
-//	txn := db.NewTransaction(false)
-//	defer txn.Discard()
-//	// Call various APIs.
+//  txn := db.NewTransaction(false)
+//  defer txn.Discard()
+//  // Call various APIs.
 func (db *DB) NewTransaction(update bool) *Txn {
 	return db.newTransaction(update, false)
 }
@@ -786,9 +788,6 @@ func (db *DB) newTransaction(update, isManaged bool) *Txn {
 // returned by the function is relayed by the View method.
 // If View is used with managed transactions, it would assume a read timestamp of MaxUint64.
 func (db *DB) View(fn func(txn *Txn) error) error {
-	if db.IsClosed() {
-		return ErrDBClosed
-	}
 	var txn *Txn
 	if db.opt.managedTxns {
 		txn = db.NewTransactionAt(math.MaxUint64, false)
@@ -804,9 +803,6 @@ func (db *DB) View(fn func(txn *Txn) error) error {
 // for the user. Error returned by the function is relayed by the Update method.
 // Update cannot be used with managed transactions.
 func (db *DB) Update(fn func(txn *Txn) error) error {
-	if db.IsClosed() {
-		return ErrDBClosed
-	}
 	if db.opt.managedTxns {
 		panic("Update can only be used with managedDB=false.")
 	}

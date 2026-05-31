@@ -1,25 +1,18 @@
-/*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
- */
-
 package badger
 
 import (
 	"fmt"
+	"io/ioutil"
 	"math"
 	"math/rand"
-	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/dgraph-io/badger/v2/y"
 	"github.com/stretchr/testify/require"
-
-	"github.com/kinet-labs/zapdb/y"
-	"github.com/dgraph-io/ristretto/v2/z"
 )
 
 func val(large bool) []byte {
@@ -63,7 +56,7 @@ func numKeysManaged(db *DB, readTs uint64) int {
 }
 
 func TestDropAllManaged(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 	opts := getTestOptions(dir)
@@ -79,7 +72,7 @@ func TestDropAllManaged(t *testing.T) {
 			wg.Add(1)
 			txn := db.NewTransactionAt(math.MaxUint64, true)
 			require.NoError(t, txn.SetEntry(NewEntry([]byte(key("key", int(i))), val(true))))
-			require.NoError(t, txn.CommitAt(i, func(err error) {
+			require.NoError(t, txn.CommitAt(uint64(i), func(err error) {
 				require.NoError(t, err)
 				wg.Done()
 			}))
@@ -108,7 +101,7 @@ func TestDropAllManaged(t *testing.T) {
 }
 
 func TestDropAll(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 	opts := getTestOptions(dir)
@@ -172,7 +165,7 @@ func TestDropAllTwice(t *testing.T) {
 		require.NoError(t, db.Close())
 	}
 	t.Run("disk mode", func(t *testing.T) {
-		dir, err := os.MkdirTemp("", "badger-test")
+		dir, err := ioutil.TempDir("", "badger-test")
 		require.NoError(t, err)
 		defer removeDir(dir)
 		opts := getTestOptions(dir)
@@ -187,7 +180,7 @@ func TestDropAllTwice(t *testing.T) {
 }
 
 func TestDropAllWithPendingTxn(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 	opts := getTestOptions(dir)
@@ -258,7 +251,7 @@ func TestDropAllWithPendingTxn(t *testing.T) {
 }
 
 func TestDropReadOnly(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 	opts := getTestOptions(dir)
@@ -285,13 +278,13 @@ func TestDropReadOnly(t *testing.T) {
 		require.Equal(t, err, ErrWindowsNotSupported)
 	} else {
 		require.NoError(t, err)
-		require.Panics(t, func() { _ = db2.DropAll() })
+		require.Panics(t, func() { db2.DropAll() })
 		require.NoError(t, db2.Close())
 	}
 }
 
 func TestWriteAfterClose(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 	opts := getTestOptions(dir)
@@ -313,11 +306,11 @@ func TestWriteAfterClose(t *testing.T) {
 	err = db.Update(func(txn *Txn) error {
 		return txn.SetEntry(NewEntry([]byte("a"), []byte("b")))
 	})
-	require.Equal(t, ErrDBClosed, err)
+	require.Equal(t, ErrBlockedWrites, err)
 }
 
 func TestDropAllRace(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 	opts := getTestOptions(dir)
@@ -327,14 +320,14 @@ func TestDropAllRace(t *testing.T) {
 
 	N := 10000
 	// Start a goroutine to keep trying to write to DB while DropAll happens.
-	closer := z.NewCloser(1)
+	closer := y.NewCloser(1)
 	go func() {
 		defer closer.Done()
 		ticker := time.NewTicker(time.Millisecond)
 		defer ticker.Stop()
 
 		i := N + 1 // Writes would happen above N.
-		var errors atomic.Int32
+		var errors int32
 		for {
 			select {
 			case <-ticker.C:
@@ -343,10 +336,10 @@ func TestDropAllRace(t *testing.T) {
 				require.NoError(t, txn.SetEntry(NewEntry([]byte(key("key", i)), val(false))))
 				if err := txn.CommitAt(uint64(i), func(err error) {
 					if err != nil {
-						errors.Add(1)
+						atomic.AddInt32(&errors, 1)
 					}
 				}); err != nil {
-					errors.Add(1)
+					atomic.AddInt32(&errors, 1)
 				}
 			case <-closer.HasBeenClosed():
 				// The following causes a data race.
@@ -381,7 +374,7 @@ func TestDropAllRace(t *testing.T) {
 }
 
 func TestDropPrefix(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 	opts := getTestOptions(dir)
@@ -422,18 +415,17 @@ func TestDropPrefix(t *testing.T) {
 	populate(db)
 	require.Equal(t, int(N), numKeys(db))
 	require.NoError(t, db.DropPrefix([]byte("key")))
-	require.Equal(t, 0, numKeys(db))
-	require.NoError(t, db.Close())
+	db.Close()
 
 	// Ensure that value log is correctly replayed.
 	db2, err := Open(opts)
 	require.NoError(t, err)
 	require.Equal(t, 0, numKeys(db2))
-	require.NoError(t, db2.Close())
+	db2.Close()
 }
 
 func TestDropPrefixWithPendingTxn(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 	opts := getTestOptions(dir)
@@ -505,7 +497,7 @@ func TestDropPrefixWithPendingTxn(t *testing.T) {
 }
 
 func TestDropPrefixReadOnly(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 	opts := getTestOptions(dir)
@@ -532,13 +524,13 @@ func TestDropPrefixReadOnly(t *testing.T) {
 		require.Equal(t, err, ErrWindowsNotSupported)
 	} else {
 		require.NoError(t, err)
-		require.Panics(t, func() { _ = db2.DropPrefix([]byte("key0")) })
+		require.Panics(t, func() { db2.DropPrefix([]byte("key0")) })
 		require.NoError(t, db2.Close())
 	}
 }
 
 func TestDropPrefixRace(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 	opts := getTestOptions(dir)
@@ -548,14 +540,14 @@ func TestDropPrefixRace(t *testing.T) {
 
 	N := 10000
 	// Start a goroutine to keep trying to write to DB while DropPrefix happens.
-	closer := z.NewCloser(1)
+	closer := y.NewCloser(1)
 	go func() {
 		defer closer.Done()
 		ticker := time.NewTicker(time.Millisecond)
 		defer ticker.Stop()
 
 		i := N + 1 // Writes would happen above N.
-		var errors atomic.Int32
+		var errors int32
 		for {
 			select {
 			case <-ticker.C:
@@ -564,10 +556,10 @@ func TestDropPrefixRace(t *testing.T) {
 				require.NoError(t, txn.SetEntry(NewEntry([]byte(key("key", i)), val(false))))
 				if err := txn.CommitAt(uint64(i), func(err error) {
 					if err != nil {
-						errors.Add(1)
+						atomic.AddInt32(&errors, 1)
 					}
 				}); err != nil {
-					errors.Add(1)
+					atomic.AddInt32(&errors, 1)
 				}
 			case <-closer.HasBeenClosed():
 				// The following causes a data race.
@@ -612,7 +604,7 @@ func TestWriteBatchManagedMode(t *testing.T) {
 	}
 	opt := DefaultOptions("")
 	opt.managedTxns = true
-	opt.BaseTableSize = 1 << 20 // This would create multiple transactions in write batch.
+	opt.MaxTableSize = 1 << 20 // This would create multiple transactions in write batch.
 	runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
 		wb := db.NewWriteBatchAt(1)
 		defer wb.Cancel()
@@ -658,7 +650,7 @@ func TestWriteBatchManaged(t *testing.T) {
 	}
 	opt := DefaultOptions("")
 	opt.managedTxns = true
-	opt.BaseTableSize = 1 << 15 // This would create multiple transactions in write batch.
+	opt.MaxTableSize = 1 << 15 // This would create multiple transactions in write batch.
 	runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
 		wb := db.NewManagedWriteBatch()
 		defer wb.Cancel()
@@ -727,7 +719,7 @@ func TestWriteBatchDuplicate(t *testing.T) {
 
 	t.Run("writebatch", func(t *testing.T) {
 		opt := DefaultOptions("")
-		opt.BaseTableSize = 1 << 15 // This would create multiple transactions in write batch.
+		opt.MaxTableSize = 1 << 15 // This would create multiple transactions in write batch.
 
 		runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
 			wb := db.NewWriteBatch()
@@ -743,7 +735,7 @@ func TestWriteBatchDuplicate(t *testing.T) {
 	})
 	t.Run("writebatch at", func(t *testing.T) {
 		opt := DefaultOptions("")
-		opt.BaseTableSize = 1 << 15 // This would create multiple transactions in write batch.
+		opt.MaxTableSize = 1 << 15 // This would create multiple transactions in write batch.
 		opt.managedTxns = true
 
 		runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
@@ -762,78 +754,17 @@ func TestWriteBatchDuplicate(t *testing.T) {
 	t.Run("managed writebatch", func(t *testing.T) {
 		opt := DefaultOptions("")
 		opt.managedTxns = true
-		opt.BaseTableSize = 1 << 15 // This would create multiple transactions in write batch.
+		opt.MaxTableSize = 1 << 15 // This would create multiple transactions in write batch.
 		runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
 			wb := db.NewManagedWriteBatch()
 			defer wb.Cancel()
 
-			for i := uint64(1); i <= uint64(N); i++ {
+			for i := uint64(0); i < uint64(N); i++ {
 				// Multiple versions of the same key.
 				require.NoError(t, wb.SetEntryAt(&Entry{Key: k, Value: v}, i))
 			}
 			require.NoError(t, wb.Flush())
-			readVerify(t, db, N, []int{10, 9, 8, 7, 6, 5, 4, 3, 2, 1})
-		})
-	})
-}
-
-func TestZeroDiscardStats(t *testing.T) {
-	N := uint64(10000)
-	populate := func(t *testing.T, db *DB) {
-		writer := db.NewWriteBatch()
-		for i := uint64(0); i < N; i++ {
-			require.NoError(t, writer.Set([]byte(key("key", int(i))), val(true)))
-		}
-		require.NoError(t, writer.Flush())
-	}
-
-	t.Run("after rewrite", func(t *testing.T) {
-		opts := getTestOptions("")
-		opts.ValueLogFileSize = 5 << 20
-		opts.ValueThreshold = 1 << 10
-		opts.MemTableSize = 1 << 15
-		runBadgerTest(t, &opts, func(t *testing.T, db *DB) {
-			populate(t, db)
-			require.Equal(t, int(N), numKeys(db))
-
-			fids := db.vlog.sortedFids()
-			for _, fid := range fids {
-				db.vlog.discardStats.Update(fid, 1)
-			}
-
-			// Ensure we have some valid fids.
-			require.True(t, len(fids) > 2)
-			fid := fids[0]
-			require.NoError(t, db.vlog.rewrite(db.vlog.filesMap[fid]))
-			// All data should still be present.
-			require.Equal(t, int(N), numKeys(db))
-
-			db.vlog.discardStats.Iterate(func(id, val uint64) {
-				// Vlog with id=fid has been re-written, it's discard stats should be zero.
-				if uint32(id) == fid {
-					require.Zero(t, val)
-				}
-			})
-		})
-	})
-	t.Run("after dropall", func(t *testing.T) {
-		opts := getTestOptions("")
-		opts.ValueLogFileSize = 5 << 20
-		runBadgerTest(t, &opts, func(t *testing.T, db *DB) {
-			populate(t, db)
-			require.Equal(t, int(N), numKeys(db))
-
-			// Fill discard stats. Normally these are filled by compaction.
-			fids := db.vlog.sortedFids()
-			for _, fid := range fids {
-				db.vlog.discardStats.Update(fid, 1)
-			}
-
-			db.vlog.discardStats.Iterate(func(id, val uint64) { require.NotZero(t, val) })
-			require.NoError(t, db.DropAll())
-			require.Equal(t, 0, numKeys(db))
-			// We've deleted everything. DS should be zero.
-			db.vlog.discardStats.Iterate(func(id, val uint64) { require.Zero(t, val) })
+			readVerify(t, db, N, []int{9, 8, 7, 6, 5, 4, 3, 2, 1, 0})
 		})
 	})
 }

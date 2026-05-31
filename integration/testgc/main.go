@@ -1,8 +1,3 @@
-/*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
- */
-
 package main
 
 import (
@@ -11,15 +6,15 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
-	_ "net/http/pprof" //nolint:gosec
+	_ "net/http/pprof"
 	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/kinet-labs/zapdb"
-	"github.com/kinet-labs/zapdb/y"
-	"github.com/dgraph-io/ristretto/v2/z"
+	"github.com/dgraph-io/badger/v2"
+	"github.com/dgraph-io/badger/v2/options"
+	"github.com/dgraph-io/badger/v2/y"
 )
 
 var maxValue int64 = 10000000
@@ -29,7 +24,7 @@ type testSuite struct {
 	sync.Mutex
 	vals map[uint64]uint64
 
-	count atomic.Uint64 // Not under mutex lock.
+	count uint64 // Not under mutex lock.
 }
 
 func encoded(i uint64) []byte {
@@ -44,7 +39,7 @@ func (s *testSuite) write(db *badger.DB) error {
 			// These keys would be overwritten.
 			keyi := uint64(rand.Int63n(maxValue))
 			key := encoded(keyi)
-			vali := s.count.Add(1)
+			vali := atomic.AddUint64(&s.count, 1)
 			val := encoded(vali)
 			val = append(val, suffix...)
 			if err := txn.SetEntry(badger.NewEntry(key, val)); err != nil {
@@ -53,7 +48,7 @@ func (s *testSuite) write(db *badger.DB) error {
 		}
 		for i := 0; i < 20; i++ {
 			// These keys would be new and never overwritten.
-			keyi := s.count.Add(1)
+			keyi := atomic.AddUint64(&s.count, 1)
 			if keyi%1000000 == 0 {
 				log.Printf("Count: %d\n", keyi)
 			}
@@ -68,7 +63,7 @@ func (s *testSuite) write(db *badger.DB) error {
 }
 
 func (s *testSuite) read(db *badger.DB) error {
-	max := int64(s.count.Load())
+	max := int64(atomic.LoadUint64(&s.count))
 	keyi := uint64(rand.Int63n(max))
 	key := encoded(keyi)
 
@@ -108,6 +103,8 @@ func main() {
 	os.RemoveAll(dir)
 
 	db, err := badger.Open(badger.DefaultOptions(dir).
+		WithTableLoadingMode(options.MemoryMap).
+		WithValueLogLoadingMode(options.FileIO).
 		WithSyncWrites(false))
 	if err != nil {
 		log.Fatal(err)
@@ -118,7 +115,7 @@ func main() {
 		_ = http.ListenAndServe("localhost:8080", nil)
 	}()
 
-	closer := z.NewCloser(11)
+	closer := y.NewCloser(11)
 	go func() {
 		// Run value log GC.
 		defer closer.Done()
@@ -143,9 +140,11 @@ func main() {
 		}
 	}()
 
-	s := testSuite{vals: make(map[uint64]uint64)}
-	s.count.Store(uint64(maxValue))
-	var numLoops atomic.Uint64
+	s := testSuite{
+		count: uint64(maxValue),
+		vals:  make(map[uint64]uint64),
+	}
+	var numLoops uint64
 	ticker := time.NewTicker(5 * time.Second)
 	for i := 0; i < 10; i++ {
 		go func() {
@@ -159,7 +158,7 @@ func main() {
 						log.Fatal(err)
 					}
 				}
-				nl := numLoops.Add(1)
+				nl := atomic.AddUint64(&numLoops, 1)
 				select {
 				case <-closer.HasBeenClosed():
 					return

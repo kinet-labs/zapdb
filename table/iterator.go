@@ -1,18 +1,28 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package table
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"sort"
 
-	"github.com/kinet-labs/zapdb/fb"
-	"github.com/kinet-labs/zapdb/y"
+	"github.com/dgraph-io/badger/v2/y"
+	"github.com/pkg/errors"
 )
 
 type blockIterator struct {
@@ -23,21 +33,13 @@ type blockIterator struct {
 	key          []byte
 	val          []byte
 	entryOffsets []uint32
-	block        *Block
 
-	tableID uint64
-	blockID int
 	// prevOverlap stores the overlap of the previous key with the base key.
 	// This avoids unnecessary copy of base key when the overlap is same for multiple keys.
 	prevOverlap uint16
 }
 
-func (itr *blockIterator) setBlock(b *Block) {
-	// Decrement the ref for the old block. If the old block was compressed, we
-	// might be able to reuse it.
-	itr.block.decrRef()
-
-	itr.block = b
+func (itr *blockIterator) setBlock(b *block) {
 	itr.err = nil
 	itr.idx = 0
 	itr.baseKey = itr.baseKey[:0]
@@ -65,7 +67,6 @@ func (itr *blockIterator) setIdx(i int) {
 		baseHeader.Decode(itr.data)
 		itr.baseKey = itr.data[headerSize : headerSize+baseHeader.diff]
 	}
-
 	var endOffset int
 	// idx points to the last entry in the block.
 	if itr.idx+1 == len(itr.entryOffsets) {
@@ -75,17 +76,6 @@ func (itr *blockIterator) setIdx(i int) {
 		// EndOffset of the current entry is the start offset of the next entry.
 		endOffset = int(itr.entryOffsets[itr.idx+1])
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			var debugBuf bytes.Buffer
-			fmt.Fprintf(&debugBuf, "==== Recovered====\n")
-			fmt.Fprintf(&debugBuf, "Table ID: %d\nBlock ID: %d\nEntry Idx: %d\nData len: %d\n"+
-				"StartOffset: %d\nEndOffset: %d\nEntryOffsets len: %d\nEntryOffsets: %v\n",
-				itr.tableID, itr.blockID, itr.idx, len(itr.data), startOffset, endOffset,
-				len(itr.entryOffsets), itr.entryOffsets)
-			panic(debugBuf.String())
-		}
-	}()
 
 	entryData := itr.data[startOffset:endOffset]
 	var h header
@@ -111,9 +101,7 @@ func (itr *blockIterator) Error() error {
 	return itr.err
 }
 
-func (itr *blockIterator) Close() {
-	itr.block.decrRef()
-}
+func (itr *blockIterator) Close() {}
 
 var (
 	origin  = 0
@@ -170,19 +158,19 @@ type Iterator struct {
 
 	// Internally, Iterator is bidirectional. However, we only expose the
 	// unidirectional functionality for now.
-	opt int // Valid options are REVERSED and NOCACHE.
+	reversed bool
 }
 
 // NewIterator returns a new iterator of the Table
-func (t *Table) NewIterator(opt int) *Iterator {
+func (t *Table) NewIterator(reversed bool) *Iterator {
 	t.IncrRef() // Important.
-	ti := &Iterator{t: t, opt: opt}
+	ti := &Iterator{t: t, reversed: reversed}
+	ti.next()
 	return ti
 }
 
 // Close closes the iterator (and it must be called).
 func (itr *Iterator) Close() error {
-	itr.bi.Close()
 	return itr.t.DecrRef()
 }
 
@@ -196,43 +184,35 @@ func (itr *Iterator) Valid() bool {
 	return itr.err == nil
 }
 
-func (itr *Iterator) useCache() bool {
-	return itr.opt&NOCACHE == 0
-}
-
 func (itr *Iterator) seekToFirst() {
-	numBlocks := itr.t.offsetsLength()
+	numBlocks := itr.t.noOfBlocks
 	if numBlocks == 0 {
 		itr.err = io.EOF
 		return
 	}
 	itr.bpos = 0
-	block, err := itr.t.block(itr.bpos, itr.useCache())
+	block, err := itr.t.block(itr.bpos)
 	if err != nil {
 		itr.err = err
 		return
 	}
-	itr.bi.tableID = itr.t.id
-	itr.bi.blockID = itr.bpos
 	itr.bi.setBlock(block)
 	itr.bi.seekToFirst()
 	itr.err = itr.bi.Error()
 }
 
 func (itr *Iterator) seekToLast() {
-	numBlocks := itr.t.offsetsLength()
+	numBlocks := itr.t.noOfBlocks
 	if numBlocks == 0 {
 		itr.err = io.EOF
 		return
 	}
 	itr.bpos = numBlocks - 1
-	block, err := itr.t.block(itr.bpos, itr.useCache())
+	block, err := itr.t.block(itr.bpos)
 	if err != nil {
 		itr.err = err
 		return
 	}
-	itr.bi.tableID = itr.t.id
-	itr.bi.blockID = itr.bpos
 	itr.bi.setBlock(block)
 	itr.bi.seekToLast()
 	itr.err = itr.bi.Error()
@@ -240,13 +220,11 @@ func (itr *Iterator) seekToLast() {
 
 func (itr *Iterator) seekHelper(blockIdx int, key []byte) {
 	itr.bpos = blockIdx
-	block, err := itr.t.block(blockIdx, itr.useCache())
+	block, err := itr.t.block(blockIdx)
 	if err != nil {
 		itr.err = err
 		return
 	}
-	itr.bi.tableID = itr.t.id
-	itr.bi.blockID = itr.bpos
 	itr.bi.setBlock(block)
 	itr.bi.seek(key, origin)
 	itr.err = itr.bi.Error()
@@ -261,11 +239,9 @@ func (itr *Iterator) seekFrom(key []byte, whence int) {
 	case current:
 	}
 
-	var ko fb.BlockOffset
-	idx := sort.Search(itr.t.offsetsLength(), func(idx int) bool {
-		// Offsets should never return false since we're iterating within the OffsetsLength.
-		y.AssertTrue(itr.t.offsets(&ko, idx))
-		return y.CompareKeys(ko.KeyBytes(), key) > 0
+	idx := sort.Search(itr.t.noOfBlocks, func(idx int) bool {
+		ko := itr.t.blockOffsets()[idx]
+		return y.CompareKeys(ko.Key, key) > 0
 	})
 	if idx == 0 {
 		// The smallest key in our table is already strictly > key. We can return that.
@@ -283,7 +259,7 @@ func (itr *Iterator) seekFrom(key []byte, whence int) {
 	itr.seekHelper(idx-1, key)
 	if itr.err == io.EOF {
 		// Case 1. Need to visit block[idx].
-		if idx == itr.t.offsetsLength() {
+		if idx == itr.t.noOfBlocks {
 			// If idx == len(itr.t.blockIndex), then input key is greater than ANY element of table.
 			// There's nothing we can do. Valid() should return false as we seek to end of table.
 			return
@@ -311,19 +287,17 @@ func (itr *Iterator) seekForPrev(key []byte) {
 func (itr *Iterator) next() {
 	itr.err = nil
 
-	if itr.bpos >= itr.t.offsetsLength() {
+	if itr.bpos >= itr.t.noOfBlocks {
 		itr.err = io.EOF
 		return
 	}
 
 	if len(itr.bi.data) == 0 {
-		block, err := itr.t.block(itr.bpos, itr.useCache())
+		block, err := itr.t.block(itr.bpos)
 		if err != nil {
 			itr.err = err
 			return
 		}
-		itr.bi.tableID = itr.t.id
-		itr.bi.blockID = itr.bpos
 		itr.bi.setBlock(block)
 		itr.bi.seekToFirst()
 		itr.err = itr.bi.Error()
@@ -347,13 +321,11 @@ func (itr *Iterator) prev() {
 	}
 
 	if len(itr.bi.data) == 0 {
-		block, err := itr.t.block(itr.bpos, itr.useCache())
+		block, err := itr.t.block(itr.bpos)
 		if err != nil {
 			itr.err = err
 			return
 		}
-		itr.bi.tableID = itr.t.id
-		itr.bi.blockID = itr.bpos
 		itr.bi.setBlock(block)
 		itr.bi.seekToLast()
 		itr.err = itr.bi.Error()
@@ -391,7 +363,7 @@ func (itr *Iterator) ValueCopy() (ret y.ValueStruct) {
 
 // Next follows the y.Iterator interface
 func (itr *Iterator) Next() {
-	if itr.opt&REVERSED == 0 {
+	if !itr.reversed {
 		itr.next()
 	} else {
 		itr.prev()
@@ -400,7 +372,7 @@ func (itr *Iterator) Next() {
 
 // Rewind follows the y.Iterator interface
 func (itr *Iterator) Rewind() {
-	if itr.opt&REVERSED == 0 {
+	if !itr.reversed {
 		itr.seekToFirst()
 	} else {
 		itr.seekToLast()
@@ -409,30 +381,25 @@ func (itr *Iterator) Rewind() {
 
 // Seek follows the y.Iterator interface
 func (itr *Iterator) Seek(key []byte) {
-	if itr.opt&REVERSED == 0 {
+	if !itr.reversed {
 		itr.seek(key)
 	} else {
 		itr.seekForPrev(key)
 	}
 }
 
-var (
-	REVERSED int = 2
-	NOCACHE  int = 4
-)
-
 // ConcatIterator concatenates the sequences defined by several iterators.  (It only works with
 // TableIterators, probably just because it's faster to not be so generic.)
 type ConcatIterator struct {
-	idx     int // Which iterator is active now.
-	cur     *Iterator
-	iters   []*Iterator // Corresponds to tables.
-	tables  []*Table    // Disregarding reversed, this is in ascending order.
-	options int         // Valid options are REVERSED and NOCACHE.
+	idx      int // Which iterator is active now.
+	cur      *Iterator
+	iters    []*Iterator // Corresponds to tables.
+	tables   []*Table    // Disregarding reversed, this is in ascending order.
+	reversed bool
 }
 
 // NewConcatIterator creates a new concatenated iterator
-func NewConcatIterator(tbls []*Table, opt int) *ConcatIterator {
+func NewConcatIterator(tbls []*Table, reversed bool) *ConcatIterator {
 	iters := make([]*Iterator, len(tbls))
 	for i := 0; i < len(tbls); i++ {
 		// Increment the reference count. Since, we're not creating the iterator right now.
@@ -443,10 +410,10 @@ func NewConcatIterator(tbls []*Table, opt int) *ConcatIterator {
 		// iters[i] = tbls[i].NewIterator(reversed)
 	}
 	return &ConcatIterator{
-		options: opt,
-		iters:   iters,
-		tables:  tbls,
-		idx:     -1, // Not really necessary because s.it.Valid()=false, but good to have.
+		reversed: reversed,
+		iters:    iters,
+		tables:   tbls,
+		idx:      -1, // Not really necessary because s.it.Valid()=false, but good to have.
 	}
 }
 
@@ -457,7 +424,7 @@ func (s *ConcatIterator) setIdx(idx int) {
 		return
 	}
 	if s.iters[idx] == nil {
-		s.iters[idx] = s.tables[idx].NewIterator(s.options)
+		s.iters[idx] = s.tables[idx].NewIterator(s.reversed)
 	}
 	s.cur = s.iters[s.idx]
 }
@@ -467,7 +434,7 @@ func (s *ConcatIterator) Rewind() {
 	if len(s.iters) == 0 {
 		return
 	}
-	if s.options&REVERSED == 0 {
+	if !s.reversed {
 		s.setIdx(0)
 	} else {
 		s.setIdx(len(s.iters) - 1)
@@ -493,7 +460,7 @@ func (s *ConcatIterator) Value() y.ValueStruct {
 // Seek brings us to element >= key if reversed is false. Otherwise, <= key.
 func (s *ConcatIterator) Seek(key []byte) {
 	var idx int
-	if s.options&REVERSED == 0 {
+	if !s.reversed {
 		idx = sort.Search(len(s.tables), func(i int) bool {
 			return y.CompareKeys(s.tables[i].Biggest(), key) >= 0
 		})
@@ -521,7 +488,7 @@ func (s *ConcatIterator) Next() {
 		return
 	}
 	for { // In case there are empty tables.
-		if s.options&REVERSED == 0 {
+		if !s.reversed {
 			s.setIdx(s.idx + 1)
 		} else {
 			s.setIdx(s.idx - 1)
@@ -550,7 +517,7 @@ func (s *ConcatIterator) Close() error {
 			continue
 		}
 		if err := it.Close(); err != nil {
-			return y.Wrap(err, "ConcatIterator")
+			return errors.Wrap(err, "ConcatIterator")
 		}
 	}
 	return nil

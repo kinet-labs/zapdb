@@ -1,17 +1,27 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
 
 import (
-	stderrors "errors"
 	"sync"
 	"time"
 
-	"github.com/kinet-labs/zapdb/y"
-	"github.com/dgraph-io/ristretto/v2/z"
+	"github.com/dgraph-io/badger/v2/y"
+	"github.com/pkg/errors"
 )
 
 // MergeOperator represents a Badger merge operator.
@@ -20,7 +30,7 @@ type MergeOperator struct {
 	f      MergeFunc
 	db     *DB
 	key    []byte
-	closer *z.Closer
+	closer *y.Closer
 }
 
 // MergeFunc accepts two byte slices, one representing an existing value, and
@@ -39,14 +49,14 @@ func (db *DB) GetMergeOperator(key []byte,
 		f:      f,
 		db:     db,
 		key:    key,
-		closer: z.NewCloser(1),
+		closer: y.NewCloser(1),
 	}
 
 	go op.runCompactions(dur)
 	return op
 }
 
-var errNoMerge = stderrors.New("No need for merge")
+var errNoMerge = errors.New("No need for merge")
 
 func (op *MergeOperator) iterateAndMerge() (newVal []byte, latest uint64, err error) {
 	txn := op.db.NewTransaction(false)
@@ -59,9 +69,6 @@ func (op *MergeOperator) iterateAndMerge() (newVal []byte, latest uint64, err er
 	var numVersions int
 	for it.Rewind(); it.Valid(); it.Next() {
 		item := it.Item()
-		if item.IsDeletedOrExpired() {
-			break
-		}
 		numVersions++
 		if numVersions == 1 {
 			// This should be the newVal, considering this is the latest version.

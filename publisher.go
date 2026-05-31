@@ -1,28 +1,33 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2019 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
 
 import (
 	"sync"
-	"sync/atomic"
 
-	"github.com/kinet-labs/zapdb/pb"
-	"github.com/kinet-labs/zapdb/trie"
-	"github.com/kinet-labs/zapdb/y"
-	"github.com/dgraph-io/ristretto/v2/z"
+	"github.com/dgraph-io/badger/v2/pb"
+	"github.com/dgraph-io/badger/v2/trie"
+	"github.com/dgraph-io/badger/v2/y"
 )
 
 type subscriber struct {
-	id        uint64
-	matches   []pb.Match
-	sendCh    chan *pb.KVList
-	subCloser *z.Closer
-	// this will be atomic pointer which will be used to
-	// track whether the subscriber is active or not
-	active *atomic.Uint64
+	prefixes  [][]byte
+	sendCh    chan<- *pb.KVList
+	subCloser *y.Closer
 }
 
 type publisher struct {
@@ -42,7 +47,7 @@ func newPublisher() *publisher {
 	}
 }
 
-func (p *publisher) listenForUpdates(c *z.Closer) {
+func (p *publisher) listenForUpdates(c *y.Closer) {
 	defer func() {
 		p.cleanSubscribers()
 		c.Done()
@@ -79,56 +84,46 @@ func (p *publisher) publishUpdates(reqs requests) {
 	for _, req := range reqs {
 		for _, e := range req.Entries {
 			ids := p.indexer.Get(e.Key)
-			if len(ids) == 0 {
-				continue
-			}
-			k := y.SafeCopy(nil, e.Key)
-			kv := &pb.KV{
-				Key:       y.ParseKey(k),
-				Value:     y.SafeCopy(nil, e.Value),
-				Meta:      []byte{e.UserMeta},
-				ExpiresAt: e.ExpiresAt,
-				Version:   y.ParseTs(k),
-			}
-			for id := range ids {
-				if _, ok := batchedUpdates[id]; !ok {
-					batchedUpdates[id] = &pb.KVList{}
+			if len(ids) > 0 {
+				k := y.SafeCopy(nil, e.Key)
+				kv := &pb.KV{
+					Key:       y.ParseKey(k),
+					Value:     y.SafeCopy(nil, e.Value),
+					Meta:      []byte{e.UserMeta},
+					ExpiresAt: e.ExpiresAt,
+					Version:   y.ParseTs(k),
 				}
-				batchedUpdates[id].Kv = append(batchedUpdates[id].Kv, kv)
+				for id := range ids {
+					if _, ok := batchedUpdates[id]; !ok {
+						batchedUpdates[id] = &pb.KVList{}
+					}
+					batchedUpdates[id].Kv = append(batchedUpdates[id].Kv, kv)
+				}
 			}
 		}
 	}
 
 	for id, kvs := range batchedUpdates {
-		if p.subscribers[id].active.Load() == 1 {
-			p.subscribers[id].sendCh <- kvs
-		}
+		p.subscribers[id].sendCh <- kvs
 	}
 }
 
-func (p *publisher) newSubscriber(c *z.Closer, matches []pb.Match) (subscriber, error) {
+func (p *publisher) newSubscriber(c *y.Closer, prefixes ...[]byte) (<-chan *pb.KVList, uint64) {
 	p.Lock()
 	defer p.Unlock()
 	ch := make(chan *pb.KVList, 1000)
 	id := p.nextID
 	// Increment next ID.
 	p.nextID++
-	s := subscriber{
-		id:        id,
-		matches:   matches,
+	p.subscribers[id] = subscriber{
+		prefixes:  prefixes,
 		sendCh:    ch,
 		subCloser: c,
-		active:    new(atomic.Uint64),
 	}
-	s.active.Store(1)
-
-	p.subscribers[id] = s
-	for _, m := range matches {
-		if err := p.indexer.AddMatch(m, id); err != nil {
-			return subscriber{}, err
-		}
+	for _, prefix := range prefixes {
+		p.indexer.Add(prefix, id)
 	}
-	return s, nil
+	return ch, id
 }
 
 // cleanSubscribers stops all the subscribers. Ideally, It should be called while closing DB.
@@ -136,8 +131,8 @@ func (p *publisher) cleanSubscribers() {
 	p.Lock()
 	defer p.Unlock()
 	for id, s := range p.subscribers {
-		for _, m := range s.matches {
-			_ = p.indexer.DeleteMatch(m, id)
+		for _, prefix := range s.prefixes {
+			p.indexer.Delete(prefix, id)
 		}
 		delete(p.subscribers, id)
 		s.subCloser.SignalAndWait()
@@ -148,8 +143,8 @@ func (p *publisher) deleteSubscriber(id uint64) {
 	p.Lock()
 	defer p.Unlock()
 	if s, ok := p.subscribers[id]; ok {
-		for _, m := range s.matches {
-			_ = p.indexer.DeleteMatch(m, id)
+		for _, prefix := range s.prefixes {
+			p.indexer.Delete(prefix, id)
 		}
 	}
 	delete(p.subscribers, id)

@@ -1,24 +1,31 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package cmd
 
 import (
 	"bufio"
-	"math"
 	"os"
 
+	"github.com/dgraph-io/badger/v2"
 	"github.com/spf13/cobra"
-
-	"github.com/kinet-labs/zapdb"
 )
 
-var bo = struct {
-	backupFile  string
-	numVersions int
-}{}
+var backupFile string
+var truncate bool
 
 // backupCmd represents the backup command
 var backupCmd = &cobra.Command{
@@ -35,30 +42,24 @@ database.`,
 
 func init() {
 	RootCmd.AddCommand(backupCmd)
-	backupCmd.Flags().StringVarP(&bo.backupFile, "backup-file", "f",
+	backupCmd.Flags().StringVarP(&backupFile, "backup-file", "f",
 		"badger.bak", "File to backup to")
-	backupCmd.Flags().IntVarP(&bo.numVersions, "num-versions", "n",
-		0, "Number of versions to keep. A value <= 0 means keep all versions.")
+	backupCmd.Flags().BoolVarP(&truncate, "truncate", "t",
+		false, "Allow value log truncation if required.")
 }
 
 func doBackup(cmd *cobra.Command, args []string) error {
-	opt := badger.DefaultOptions(sstDir).
-		WithValueDir(vlogDir).
-		WithNumVersionsToKeep(math.MaxInt32)
-
-	if bo.numVersions > 0 {
-		opt.NumVersionsToKeep = bo.numVersions
-	}
-
 	// Open DB
-	db, err := badger.Open(opt)
+	db, err := badger.Open(badger.DefaultOptions(sstDir).
+		WithValueDir(vlogDir).
+		WithTruncate(truncate))
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
 	// Create File
-	f, err := os.Create(bo.backupFile)
+	f, err := os.Create(backupFile)
 	if err != nil {
 		return err
 	}

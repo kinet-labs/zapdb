@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package skl
@@ -9,7 +20,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/kinet-labs/zapdb/y"
+	"github.com/dgraph-io/badger/v2/y"
 )
 
 const (
@@ -24,7 +35,7 @@ const (
 
 // Arena should be lock-free.
 type Arena struct {
-	n   atomic.Uint32
+	n   uint32
 	buf []byte
 }
 
@@ -32,13 +43,19 @@ type Arena struct {
 func newArena(n int64) *Arena {
 	// Don't store data at position 0 in order to reserve offset=0 as a kind
 	// of nil pointer.
-	out := &Arena{buf: make([]byte, n)}
-	out.n.Store(1)
+	out := &Arena{
+		n:   1,
+		buf: make([]byte, n),
+	}
 	return out
 }
 
 func (s *Arena) size() int64 {
-	return int64(s.n.Load())
+	return int64(atomic.LoadUint32(&s.n))
+}
+
+func (s *Arena) reset() {
+	atomic.StoreUint32(&s.n, 0)
 }
 
 // putNode allocates a node in the arena. The node is aligned on a pointer-sized
@@ -50,7 +67,7 @@ func (s *Arena) putNode(height int) uint32 {
 
 	// Pad the allocation with enough bytes to ensure pointer alignment.
 	l := uint32(MaxNodeSize - unusedSize + nodeAlign)
-	n := s.n.Add(l)
+	n := atomic.AddUint32(&s.n, l)
 	y.AssertTruef(int(n) <= len(s.buf),
 		"Arena too small, toWrite:%d newTotal:%d limit:%d",
 		l, n, len(s.buf))
@@ -65,8 +82,8 @@ func (s *Arena) putNode(height int) uint32 {
 // size of val. We could also store this size inside arena but the encoding and
 // decoding will incur some overhead.
 func (s *Arena) putVal(v y.ValueStruct) uint32 {
-	l := v.EncodedSize()
-	n := s.n.Add(l)
+	l := uint32(v.EncodedSize())
+	n := atomic.AddUint32(&s.n, l)
 	y.AssertTruef(int(n) <= len(s.buf),
 		"Arena too small, toWrite:%d newTotal:%d limit:%d",
 		l, n, len(s.buf))
@@ -77,14 +94,11 @@ func (s *Arena) putVal(v y.ValueStruct) uint32 {
 
 func (s *Arena) putKey(key []byte) uint32 {
 	l := uint32(len(key))
-	n := s.n.Add(l)
+	n := atomic.AddUint32(&s.n, l)
 	y.AssertTruef(int(n) <= len(s.buf),
 		"Arena too small, toWrite:%d newTotal:%d limit:%d",
 		l, n, len(s.buf))
-	// m is the offset where you should write.
-	// n = new len - key len give you the offset at which you should write.
 	m := n - l
-	// Copy to buffer from m:n
 	y.AssertTrue(len(key) == copy(s.buf[m:n], key))
 	return m
 }

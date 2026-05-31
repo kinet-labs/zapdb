@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2019 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package table
@@ -8,7 +19,8 @@ package table
 import (
 	"bytes"
 
-	"github.com/kinet-labs/zapdb/y"
+	"github.com/dgraph-io/badger/v2/y"
+	"github.com/pkg/errors"
 )
 
 // MergeIterator merges multiple iterators.
@@ -104,7 +116,7 @@ func (mi *MergeIterator) fix() {
 	case cmp < 0: // Small is less than bigger().
 		if mi.reverse {
 			mi.swapSmall()
-		} else { //nolint:staticcheck
+		} else {
 			// we don't need to do anything. Small already points to the smallest.
 		}
 		return
@@ -189,9 +201,9 @@ func (mi *MergeIterator) Close() error {
 	err1 := mi.left.iter.Close()
 	err2 := mi.right.iter.Close()
 	if err1 != nil {
-		return y.Wrap(err1, "MergeIterator")
+		return errors.Wrap(err1, "MergeIterator")
 	}
-	return y.Wrap(err2, "MergeIterator")
+	return errors.Wrap(err2, "MergeIterator")
 }
 
 // NewMergeIterator creates a merge iterator.

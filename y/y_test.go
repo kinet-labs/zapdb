@@ -1,13 +1,7 @@
-/*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
- */
-
 package y
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"math/rand"
@@ -15,9 +9,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-
-	"github.com/kinet-labs/zapdb/pb"
-	"github.com/dgraph-io/ristretto/v2/z"
 )
 
 func BenchmarkBuffer(b *testing.B) {
@@ -39,7 +30,7 @@ func BenchmarkBuffer(b *testing.B) {
 		b.Run(fmt.Sprintf("page-size-%d", pageSize), func(b *testing.B) {
 			pageBuffer := NewPageBuffer(pageSize)
 			for i := 0; i < b.N; i++ {
-				_, _ = pageBuffer.Write(btw[:])
+				pageBuffer.Write(btw[:])
 			}
 		})
 	})
@@ -264,110 +255,19 @@ func TestPagebufferReader4(t *testing.T) {
 	require.Equal(t, n, 0)
 }
 
-// Test when reading into 0 length readBuffer
-func TestPagebufferReader5(t *testing.T) {
-	b := NewPageBuffer(32)
-	var wb [20]byte
-	rand.Read(wb[:])
-	n, err := b.Write(wb[:])
-	require.Equal(t, n, len(wb), "length of buffer and length written should be equal")
-	require.NoError(t, err, "unable to write bytes to buffer")
+func TestMulipleSignals(t *testing.T) {
+	closer := NewCloser(0)
+	require.NotPanics(t, func() { closer.Signal() })
+	// Should not panic.
+	require.NotPanics(t, func() { closer.Signal() })
+	require.NotPanics(t, func() { closer.SignalAndWait() })
 
-	reader := b.NewReaderAt(0)
+	// Attempt 2.
+	closer = NewCloser(1)
+	require.NotPanics(t, func() { closer.Done() })
 
-	readBuffer := []byte{} // Intentionally empty readBuffer.
-	n, err = reader.Read(readBuffer)
-	require.NoError(t, err, "reading into empty buffer should return no error")
-	require.Equal(t, 0, n, "read into empty buffer should return 0 bytes")
-}
-
-func TestSizeVarintForZero(t *testing.T) {
-	siz := sizeVarint(0)
-	require.Equal(t, 1, siz)
-}
-
-func TestEncodedSize(t *testing.T) {
-	valBufSize := uint32(rand.Int31n(1e5))
-	expiry := rand.Uint64()
-	expiryVarintBuf := make([]byte, 64)
-	expVarintSize := uint32(binary.PutUvarint(expiryVarintBuf, expiry))
-	valBuf := make([]byte, valBufSize)
-	_, _ = rand.Read(valBuf)
-
-	valStruct := &ValueStruct{
-		Value:     valBuf,
-		ExpiresAt: expiry,
-	}
-
-	require.Equal(t, valBufSize+uint32(2)+expVarintSize, valStruct.EncodedSize())
-}
-
-func TestAllocatorReuse(t *testing.T) {
-	a := z.NewAllocator(1024, "test")
-	defer a.Release()
-
-	N := 1024
-	buf := make([]byte, 4096)
-	rand.Read(buf)
-
-	for i := 0; i < N; i++ {
-		a.Reset()
-		var list pb.KVList
-		for j := 0; j < N; j++ {
-			kv := NewKV(a)
-			sz := rand.Intn(1024)
-			kv.Key = a.Copy(buf[:sz])
-			kv.Value = a.Copy(buf[:4*sz])
-			kv.Meta = a.Copy([]byte{1})
-			kv.Version = uint64(sz)
-			list.Kv = append(list.Kv, kv)
-		}
-		_, err := pb.Marshal(&list)
-		require.NoError(t, err)
-	}
-	t.Logf("Allocator: %s\n", a)
-}
-
-func TestSafeCopy_Issue2067(t *testing.T) {
-	type args struct {
-		a   []byte
-		src []byte
-	}
-	tests := []struct {
-		name string
-		args args
-		want []byte
-	}{
-		{
-			name: "Nil src should return empty slice not nil",
-			args: args{a: nil, src: nil},
-			want: []byte{},
-		},
-		{
-			name: "Empty src should return empty slice not nil",
-			args: args{a: nil, src: []byte{}},
-			want: []byte{},
-		},
-		{
-			name: "Normal src should return src content",
-			args: args{a: nil, src: []byte("hello")},
-			want: []byte("hello"),
-		},
-		{
-			name: "Buffer reuse with nil src should return empty slice",
-			args: args{a: make([]byte, 10), src: nil},
-			want: []byte{},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := SafeCopy(tt.args.a, tt.args.src)
-			require.Equal(t, tt.want, got)
-
-			// Explicit check for nil vs empty slice distinction
-			if len(tt.want) == 0 {
-				require.NotNil(t, got, "SafeCopy returned nil, but we expected an empty slice []byte{}")
-			}
-		})
-	}
+	require.NotPanics(t, func() { closer.SignalAndWait() })
+	// Should not panic.
+	require.NotPanics(t, func() { closer.SignalAndWait() })
+	require.NotPanics(t, func() { closer.Signal() })
 }

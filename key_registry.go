@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2019 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
@@ -17,8 +28,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kinet-labs/zapdb/pb"
-	"github.com/kinet-labs/zapdb/y"
+	"github.com/dgraph-io/badger/v2/pb"
+	"github.com/dgraph-io/badger/v2/y"
 )
 
 const (
@@ -75,7 +86,7 @@ func OpenKeyRegistry(opt KeyRegistryOptions) (*KeyRegistry, error) {
 		return newKeyRegistry(opt), nil
 	}
 	path := filepath.Join(opt.Dir, KeyRegistryFileName)
-	var flags y.Flags
+	var flags uint32
 	if opt.ReadOnly {
 		flags |= y.ReadOnly
 	} else {
@@ -148,7 +159,7 @@ func validRegistry(fp *os.File, encryptionKey []byte) error {
 	}
 	if len(encryptionKey) > 0 {
 		// Decrypting sanity text.
-		if eSanityText, err = y.XORBlockAllocate(eSanityText, encryptionKey, iv); err != nil {
+		if eSanityText, err = y.XORBlock(eSanityText, encryptionKey, iv); err != nil {
 			return y.Wrapf(err, "During validRegistry")
 		}
 	}
@@ -184,12 +195,12 @@ func (kri *keyRegistryIterator) next() (*pb.DataKey, error) {
 		return nil, y.Wrapf(y.ErrChecksumMismatch, "Error while checking checksum for data key.")
 	}
 	dataKey := &pb.DataKey{}
-	if err = pb.Unmarshal(data, dataKey); err != nil {
+	if err = dataKey.Unmarshal(data); err != nil {
 		return nil, y.Wrapf(err, "While unmarshal of datakey in keyRegistryIterator.next")
 	}
 	if len(kri.encryptionKey) > 0 {
 		// Decrypt the key if the storage key exists.
-		if dataKey.Data, err = y.XORBlockAllocate(dataKey.Data, kri.encryptionKey, dataKey.Iv); err != nil {
+		if dataKey.Data, err = y.XORBlock(dataKey.Data, kri.encryptionKey, dataKey.Iv); err != nil {
 			return nil, y.Wrapf(err, "While decrypting datakey in keyRegistryIterator.next")
 		}
 	}
@@ -243,9 +254,9 @@ func WriteKeyRegistry(reg *KeyRegistry, opt KeyRegistryOptions) error {
 	eSanity := sanityText
 	if len(opt.EncryptionKey) > 0 {
 		var err error
-		eSanity, err = y.XORBlockAllocate(eSanity, opt.EncryptionKey, iv)
+		eSanity, err = y.XORBlock(eSanity, opt.EncryptionKey, iv)
 		if err != nil {
-			return y.Wrapf(err, "Error while encrypting sanity text in WriteKeyRegistry")
+			return y.Wrapf(err, "Error while encrpting sanity text in WriteKeyRegistry")
 		}
 	}
 	y.Check2(buf.Write(iv))
@@ -283,8 +294,8 @@ func WriteKeyRegistry(reg *KeyRegistry, opt KeyRegistryOptions) error {
 	return syncDir(opt.Dir)
 }
 
-// DataKey returns datakey of the given key id.
-func (kr *KeyRegistry) DataKey(id uint64) (*pb.DataKey, error) {
+// dataKey returns datakey of the given key id.
+func (kr *KeyRegistry) dataKey(id uint64) (*pb.DataKey, error) {
 	kr.RLock()
 	defer kr.RUnlock()
 	if id == 0 {
@@ -298,10 +309,10 @@ func (kr *KeyRegistry) DataKey(id uint64) (*pb.DataKey, error) {
 	return dk, nil
 }
 
-// LatestDataKey will give you the latest generated datakey based on the rotation
+// latestDataKey will give you the latest generated datakey based on the rotation
 // period. If the last generated datakey lifetime exceeds the rotation period.
 // It'll create new datakey.
-func (kr *KeyRegistry) LatestDataKey() (*pb.DataKey, error) {
+func (kr *KeyRegistry) latestDataKey() (*pb.DataKey, error) {
 	if len(kr.opt.EncryptionKey) == 0 {
 		// nil is for no encryption.
 		return nil, nil
@@ -309,7 +320,7 @@ func (kr *KeyRegistry) LatestDataKey() (*pb.DataKey, error) {
 	// validKey return datakey if the last generated key duration less than
 	// rotation duration.
 	validKey := func() (*pb.DataKey, bool) {
-		// Time difference from the last generated time.
+		// Time diffrence from the last generated time.
 		diff := time.Since(time.Unix(kr.lastCreated, 0))
 		if diff < kr.opt.EncryptionKeyRotationDuration {
 			return kr.dataKeys[kr.nextKeyID], true
@@ -384,7 +395,7 @@ func storeDataKey(buf *bytes.Buffer, storageKey []byte, k *pb.DataKey) error {
 			return nil
 		}
 		var err error
-		k.Data, err = y.XORBlockAllocate(k.Data, storageKey, k.Iv)
+		k.Data, err = y.XORBlock(k.Data, storageKey, k.Iv)
 		return err
 	}
 	// In memory datakey will be plain text so encrypting before storing to the disk.
@@ -393,13 +404,13 @@ func storeDataKey(buf *bytes.Buffer, storageKey []byte, k *pb.DataKey) error {
 		return y.Wrapf(err, "Error while encrypting datakey in storeDataKey")
 	}
 	var data []byte
-	if data, err = pb.Marshal(k); err != nil {
+	if data, err = k.Marshal(); err != nil {
 		err = y.Wrapf(err, "Error while marshaling datakey in storeDataKey")
 		var err2 error
 		// decrypting the datakey back.
 		if err2 = xor(); err2 != nil {
 			return y.Wrapf(err,
-				"%s", y.Wrapf(err2, "Error while decrypting datakey in storeDataKey").Error())
+				y.Wrapf(err2, "Error while decrypting datakey in storeDataKey").Error())
 		}
 		return err
 	}

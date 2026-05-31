@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package y
@@ -18,17 +29,18 @@ package y
 // (3) You want to generate a new error with stack trace info. Use x.Errorf.
 
 import (
-	"errors"
 	"fmt"
 	"log"
+
+	"github.com/pkg/errors"
 )
 
-var debugMode = false
+var debugMode = true
 
 // Check logs fatal if err != nil.
 func Check(err error) {
 	if err != nil {
-		log.Fatalf("%+v", Wrap(err, ""))
+		log.Fatalf("%+v", Wrap(err))
 	}
 }
 
@@ -40,42 +52,32 @@ func Check2(_ interface{}, err error) {
 // AssertTrue asserts that b is true. Otherwise, it would log fatal.
 func AssertTrue(b bool) {
 	if !b {
-		log.Fatalf("%+v", errors.New("Assert failed"))
+		log.Fatalf("%+v", errors.Errorf("Assert failed"))
 	}
 }
 
 // AssertTruef is AssertTrue with extra info.
 func AssertTruef(b bool, format string, args ...interface{}) {
 	if !b {
-		log.Fatalf("%+v", fmt.Errorf(format, args...))
+		log.Fatalf("%+v", errors.Errorf(format, args...))
 	}
 }
 
 // Wrap wraps errors from external lib.
-func Wrap(err error, msg string) error {
+func Wrap(err error) error {
 	if !debugMode {
-		if err == nil {
-			return nil
-		}
-		return fmt.Errorf("%s err: %+v", msg, err)
+		return err
 	}
-	return fmt.Errorf("%s: %w", msg, err)
+	return errors.Wrap(err, "")
 }
 
 // Wrapf is Wrap with extra info.
 func Wrapf(err error, format string, args ...interface{}) error {
-	return Wrap(err, fmt.Sprintf(format, args...))
-}
-
-func CombineErrors(one, other error) error {
-	if one != nil && other != nil {
-		return fmt.Errorf("%v; %v", one, other)
+	if !debugMode {
+		if err == nil {
+			return nil
+		}
+		return fmt.Errorf(format+" error: %+v", append(args, err)...)
 	}
-	if one != nil && other == nil {
-		return fmt.Errorf("%v", one)
-	}
-	if one == nil && other != nil {
-		return fmt.Errorf("%v", other)
-	}
-	return nil
+	return errors.Wrapf(err, format, args...)
 }

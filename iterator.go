@@ -1,6 +1,17 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
@@ -9,14 +20,16 @@ import (
 	"bytes"
 	"fmt"
 	"hash/crc32"
-	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/kinet-labs/zapdb/table"
-	"github.com/kinet-labs/zapdb/y"
-	"github.com/dgraph-io/ristretto/v2/z"
+	"github.com/dgraph-io/badger/v2/options"
+	"github.com/dgraph-io/badger/v2/table"
+	"github.com/dgryski/go-farm"
+
+	"github.com/dgraph-io/badger/v2/y"
 )
 
 type prefetchStatus uint8
@@ -28,21 +41,20 @@ const (
 // Item is returned during iteration. Both the Key() and Value() output is only valid until
 // iterator.Next() is called.
 type Item struct {
+	status    prefetchStatus
+	err       error
+	wg        sync.WaitGroup
+	db        *DB
 	key       []byte
 	vptr      []byte
-	val       []byte
-	version   uint64
+	meta      byte // We need to store meta to know about bitValuePointer.
+	userMeta  byte
 	expiresAt uint64
-
-	slice *y.Slice // Used only during prefetching.
-	next  *Item
-	txn   *Txn
-
-	err      error
-	wg       sync.WaitGroup
-	status   prefetchStatus
-	meta     byte // We need to store meta to know about bitValuePointer.
-	userMeta byte
+	val       []byte
+	slice     *y.Slice // Used only during prefetching.
+	next      *Item
+	version   uint64
+	txn       *Txn
 }
 
 // String returns a string representation of Item
@@ -138,54 +150,65 @@ func (item *Item) DiscardEarlierVersions() bool {
 
 func (item *Item) yieldItemValue() ([]byte, func(), error) {
 	key := item.Key() // No need to copy.
-	if !item.hasValue() {
-		return nil, nil, nil
-	}
-
-	if item.slice == nil {
-		item.slice = new(y.Slice)
-	}
-
-	if (item.meta & bitValuePointer) == 0 {
-		val := item.slice.Resize(len(item.vptr))
-		copy(val, item.vptr)
-		return val, nil, nil
-	}
-
-	var vp valuePointer
-	vp.Decode(item.vptr)
-	db := item.txn.db
-	result, cb, err := db.vlog.Read(vp, item.slice)
-	if err != nil {
-		db.opt.Errorf("Unable to read: Key: %v, Version : %v, meta: %v, userMeta: %v"+
-			" Error: %v", key, item.version, item.meta, item.userMeta, err)
-		var txn *Txn
-		if db.opt.managedTxns {
-			txn = db.NewTransactionAt(math.MaxUint64, false)
-		} else {
-			txn = db.NewTransaction(false)
+	for {
+		if !item.hasValue() {
+			return nil, nil, nil
 		}
-		defer txn.Discard()
 
-		iopt := DefaultIteratorOptions
-		iopt.AllVersions = true
-		iopt.InternalAccess = true
-		iopt.PrefetchValues = false
+		if item.slice == nil {
+			item.slice = new(y.Slice)
+		}
 
-		it := txn.NewKeyIterator(item.Key(), iopt)
-		defer it.Close()
-		for it.Rewind(); it.Valid(); it.Next() {
-			item := it.Item()
-			var vp valuePointer
-			if item.meta&bitValuePointer > 0 {
-				vp.Decode(item.vptr)
+		if (item.meta & bitValuePointer) == 0 {
+			val := item.slice.Resize(len(item.vptr))
+			copy(val, item.vptr)
+			return val, nil, nil
+		}
+
+		var vp valuePointer
+		vp.Decode(item.vptr)
+		result, cb, err := item.db.vlog.Read(vp, item.slice)
+		if err != ErrRetry {
+			if err != nil {
+				item.db.opt.Logger.Errorf(`Unable to read: Key: %v, Version : %v,
+				meta: %v, userMeta: %v`, key, item.version, item.meta, item.userMeta)
 			}
-			db.opt.Errorf("Key: %v, Version : %v, meta: %v, userMeta: %v valuePointer: %+v",
-				item.Key(), item.version, item.meta, item.userMeta, vp)
+			return result, cb, err
+		}
+		if bytes.HasPrefix(key, badgerMove) {
+			// err == ErrRetry
+			// Error is retry even after checking the move keyspace. So, let's
+			// just assume that value is not present.
+			return nil, cb, nil
+		}
+
+		// The value pointer is pointing to a deleted value log. Look for the
+		// move key and read that instead.
+		runCallback(cb)
+		// Do not put badgerMove on the left in append. It seems to cause some sort of manipulation.
+		keyTs := y.KeyWithTs(item.Key(), item.Version())
+		key = make([]byte, len(badgerMove)+len(keyTs))
+		n := copy(key, badgerMove)
+		copy(key[n:], keyTs)
+		// Note that we can't set item.key to move key, because that would
+		// change the key user sees before and after this call. Also, this move
+		// logic is internal logic and should not impact the external behavior
+		// of the retrieval.
+		vs, err := item.db.get(key)
+		if err != nil {
+			return nil, nil, err
+		}
+		if vs.Version != item.Version() {
+			return nil, nil, nil
+		}
+		// Bug fix: Always copy the vs.Value into vptr here. Otherwise, when item is reused this
+		// slice gets overwritten.
+		item.vptr = y.SafeCopy(item.vptr, vs.Value)
+		item.meta &^= bitValuePointer // Clear the value pointer bit.
+		if vs.Meta&bitValuePointer > 0 {
+			item.meta |= bitValuePointer // This meta would only be about value pointer.
 		}
 	}
-	// Don't return error if we cannot read the value. Just log the error.
-	return result, cb, nil
 }
 
 func runCallback(cb func()) {
@@ -203,9 +226,13 @@ func (item *Item) prefetchValue() {
 	if val == nil {
 		return
 	}
-	buf := item.slice.Resize(len(val))
-	copy(buf, val)
-	item.val = buf
+	if item.db.opt.ValueLogLoadingMode == options.MemoryMap {
+		buf := item.slice.Resize(len(val))
+		copy(buf, val)
+		item.val = buf
+	} else {
+		item.val = val
+	}
 }
 
 // EstimatedSize returns the approximate size of the key-value pair.
@@ -302,22 +329,20 @@ func (l *list) pop() *Item {
 // should work for most applications. Consider using that as a starting point
 // before customizing it for your own needs.
 type IteratorOptions struct {
-	// PrefetchSize is the number of KV pairs to prefetch while iterating.
-	// Valid only if PrefetchValues is true.
-	PrefetchSize int
-	// PrefetchValues Indicates whether we should prefetch values during
-	// iteration and store them.
+	// Indicates whether we should prefetch values during iteration and store them.
 	PrefetchValues bool
-	Reverse        bool // Direction of iteration. False is forward, true is backward.
-	AllVersions    bool // Fetch all valid versions of the same key.
-	InternalAccess bool // Used to allow internal access to badger keys.
+	// How many KV pairs to prefetch while iterating. Valid only if PrefetchValues is true.
+	PrefetchSize int
+	Reverse      bool // Direction of iteration. False is forward, true is backward.
+	AllVersions  bool // Fetch all valid versions of the same key.
 
-	// The following option is used to narrow down the SSTables that iterator
-	// picks up. If Prefix is specified, only tables which could have this
-	// prefix are picked based on their range of keys.
-	prefixIsKey bool   // If set, use the prefix for bloom filter lookup.
+	// The following option is used to narrow down the SSTables that iterator picks up. If
+	// Prefix is specified, only tables which could have this prefix are picked based on their range
+	// of keys.
 	Prefix      []byte // Only iterate over this given prefix.
-	SinceTs     uint64 // Only read data that has version > SinceTs.
+	prefixIsKey bool   // If set, use the prefix for bloom filter lookup.
+
+	InternalAccess bool // Used to allow internal access to badger keys.
 }
 
 func (opt *IteratorOptions) compareToPrefix(key []byte) int {
@@ -330,10 +355,6 @@ func (opt *IteratorOptions) compareToPrefix(key []byte) int {
 }
 
 func (opt *IteratorOptions) pickTable(t table.TableInterface) bool {
-	// Ignore this table if its max version is less than the sinceTs.
-	if t.MaxVersion() < opt.SinceTs {
-		return false
-	}
 	if len(opt.Prefix) == 0 {
 		return true
 	}
@@ -345,7 +366,7 @@ func (opt *IteratorOptions) pickTable(t table.TableInterface) bool {
 	}
 	// Bloom filter lookup would only work if opt.Prefix does NOT have the read
 	// timestamp as part of the key.
-	if opt.prefixIsKey && t.DoesNotHave(y.Hash(opt.Prefix)) {
+	if opt.prefixIsKey && t.DoesNotHave(farm.Fingerprint64(opt.Prefix)) {
 		return false
 	}
 	return true
@@ -354,28 +375,12 @@ func (opt *IteratorOptions) pickTable(t table.TableInterface) bool {
 // pickTables picks the necessary table for the iterator. This function also assumes
 // that the tables are sorted in the right order.
 func (opt *IteratorOptions) pickTables(all []*table.Table) []*table.Table {
-	filterTables := func(tables []*table.Table) []*table.Table {
-		if opt.SinceTs > 0 {
-			tmp := tables[:0]
-			for _, t := range tables {
-				if t.MaxVersion() < opt.SinceTs {
-					continue
-				}
-				tmp = append(tmp, t)
-			}
-			tables = tmp
-		}
-		return tables
-	}
-
 	if len(opt.Prefix) == 0 {
 		out := make([]*table.Table, len(all))
 		copy(out, all)
-		return filterTables(out)
+		return out
 	}
 	sIdx := sort.Search(len(all), func(i int) bool {
-		// table.Biggest >= opt.prefix
-		// if opt.Prefix < table.Biggest, then surely it is not in any of the preceding tables.
 		return opt.compareToPrefix(all[i].Biggest()) >= 0
 	})
 	if sIdx == len(all) {
@@ -390,19 +395,16 @@ func (opt *IteratorOptions) pickTables(all []*table.Table) []*table.Table {
 		})
 		out := make([]*table.Table, len(filtered[:eIdx]))
 		copy(out, filtered[:eIdx])
-		return filterTables(out)
+		return out
 	}
 
-	// opt.prefixIsKey == true. This code is optimizing for opt.prefixIsKey part.
 	var out []*table.Table
-	hash := y.Hash(opt.Prefix)
+	hash := farm.Fingerprint64(opt.Prefix)
 	for _, t := range filtered {
-		// When we encounter the first table whose smallest key is higher than opt.Prefix, we can
-		// stop. This is an IMPORTANT optimization, just considering how often we call
-		// NewKeyIterator.
+		// When we encounter the first table whose smallest key is higher than
+		// opt.Prefix, we can stop.
 		if opt.compareToPrefix(t.Smallest()) > 0 {
-			// if table.Smallest > opt.Prefix, then this and all tables after this can be ignored.
-			break
+			return out
 		}
 		// opt.Prefix is actually the key. So, we can run bloom filter checks
 		// as well.
@@ -411,7 +413,7 @@ func (opt *IteratorOptions) pickTables(all []*table.Table) []*table.Table {
 		}
 		out = append(out, t)
 	}
-	return filterTables(out)
+	return out
 }
 
 // DefaultIteratorOptions contains default options when iterating over Badger key-value stores.
@@ -435,15 +437,12 @@ type Iterator struct {
 
 	lastKey []byte // Used to skip over multiple versions of the same key.
 
-	closed  bool
-	scanned int // Used to estimate the size of data scanned by iterator.
+	closed bool
 
 	// ThreadId is an optional value that can be set to identify which goroutine created
 	// the iterator. It can be used, for example, to uniquely identify each of the
 	// iterators created by the stream interface
 	ThreadId int
-
-	Alloc *z.Allocator
 }
 
 // NewIterator returns a new iterator. Depending upon the options, either only keys, or both
@@ -451,25 +450,21 @@ type Iterator struct {
 // Using prefetch is recommended if you're doing a long running iteration, for performance.
 //
 // Multiple Iterators:
-// For a read-only txn, multiple iterators can be running simultaneously. However, for a read-write
+// For a read-only txn, multiple iterators can be running simultaneously.  However, for a read-write
 // txn, iterators have the nuance of being a snapshot of the writes for the transaction at the time
 // iterator was created. If writes are performed after an iterator is created, then that iterator
 // will not be able to see those writes. Only writes performed before an iterator was created can be
 // viewed.
 func (txn *Txn) NewIterator(opt IteratorOptions) *Iterator {
 	if txn.discarded {
-		panic(ErrDiscardedTxn)
+		panic("Transaction has already been discarded")
 	}
-	if txn.db.IsClosed() {
-		panic(ErrDBClosed)
-	}
-
-	y.NumIteratorsCreatedAdd(txn.db.opt.MetricsEnabled, 1)
 
 	// Keep track of the number of active iterators.
-	txn.numIterators.Add(1)
+	atomic.AddInt32(&txn.numIterators, 1)
 
-	// TODO: If Prefix is set, only pick those memtables which have keys with the prefix.
+	// TODO: If Prefix is set, only pick those memtables which have keys with
+	// the prefix.
 	tables, decr := txn.db.getMemTables()
 	defer decr()
 	txn.db.vlog.incrIteratorCount()
@@ -478,9 +473,10 @@ func (txn *Txn) NewIterator(opt IteratorOptions) *Iterator {
 		iters = append(iters, itr)
 	}
 	for i := 0; i < len(tables); i++ {
-		iters = append(iters, tables[i].sl.NewUniIterator(opt.Reverse))
+		iters = append(iters, tables[i].NewUniIterator(opt.Reverse))
 	}
 	iters = txn.db.lc.appendIterators(iters, &opt) // This will increment references.
+
 	res := &Iterator{
 		txn:    txn,
 		iitr:   table.NewMergeIterator(iters, opt.Reverse),
@@ -506,7 +502,7 @@ func (txn *Txn) NewKeyIterator(key []byte, opt IteratorOptions) *Iterator {
 func (it *Iterator) newItem() *Item {
 	item := it.waste.pop()
 	if item == nil {
-		item = &Item{slice: new(y.Slice), txn: it.txn}
+		item = &Item{slice: new(y.Slice), db: it.txn.db, txn: it.txn}
 	}
 	return item
 }
@@ -542,10 +538,6 @@ func (it *Iterator) Close() {
 		return
 	}
 	it.closed = true
-	if it.iitr == nil {
-		it.txn.numIterators.Add(-1)
-		return
-	}
 
 	it.iitr.Close()
 	// It is important to wait for the fill goroutines to finish. Otherwise, we might leave zombie
@@ -562,23 +554,20 @@ func (it *Iterator) Close() {
 
 	// TODO: We could handle this error.
 	_ = it.txn.db.vlog.decrIteratorCount()
-	it.txn.numIterators.Add(-1)
+	atomic.AddInt32(&it.txn.numIterators, -1)
 }
 
 // Next would advance the iterator by one. Always check it.Valid() after a Next()
 // to ensure you have access to a valid it.Item().
 func (it *Iterator) Next() {
-	if it.iitr == nil {
-		return
-	}
 	// Reuse current item
 	it.item.wg.Wait() // Just cleaner to wait before pushing to avoid doing ref counting.
-	it.scanned += len(it.item.key) + len(it.item.val) + len(it.item.vptr) + 2
 	it.waste.push(it.item)
 
 	// Set next item to current
 	it.item = it.data.pop()
-	for it.iitr.Valid() && hasPrefix(it) {
+
+	for it.iitr.Valid() {
 		if it.parseItem() {
 			// parseItem calls one extra next.
 			// This is used to deal with the complexity of reverse iteration.
@@ -600,8 +589,7 @@ func isDeletedOrExpired(meta byte, expiresAt uint64) bool {
 // parseItem is a complex function because it needs to handle both forward and reverse iteration
 // implementation. We store keys such that their versions are sorted in descending order. This makes
 // forward iteration efficient, but revese iteration complicated. This tradeoff is better because
-// forward iteration is more common than reverse. It returns true, if either the iterator is invalid
-// or it has pushed an item into it.data list, else it returns false.
+// forward iteration is more common than reverse.
 //
 // This function advances the iterator.
 func (it *Iterator) parseItem() bool {
@@ -616,23 +604,15 @@ func (it *Iterator) parseItem() bool {
 		}
 	}
 
-	isInternalKey := bytes.HasPrefix(key, badgerPrefix)
 	// Skip badger keys.
-	if !it.opt.InternalAccess && isInternalKey {
+	if !it.opt.InternalAccess && bytes.HasPrefix(key, badgerPrefix) {
 		mi.Next()
 		return false
 	}
 
 	// Skip any versions which are beyond the readTs.
 	version := y.ParseTs(key)
-	// Ignore everything that is above the readTs and below or at the sinceTs.
-	if version > it.readTs || (it.opt.SinceTs > 0 && version <= it.opt.SinceTs) {
-		mi.Next()
-		return false
-	}
-
-	// Skip banned keys only if it does not have badger internal prefix.
-	if !isInternalKey && it.txn.db.isBanned(key) != nil {
+	if version > it.readTs {
 		mi.Next()
 		return false
 	}
@@ -714,15 +694,6 @@ func (it *Iterator) fill(item *Item) {
 	}
 }
 
-func hasPrefix(it *Iterator) bool {
-	// We shouldn't check prefix in case the iterator is going in reverse. Since in reverse we expect
-	// people to append items to the end of prefix.
-	if !it.opt.Reverse && len(it.opt.Prefix) > 0 {
-		return bytes.HasPrefix(y.ParseKey(it.iitr.Key()), it.opt.Prefix)
-	}
-	return true
-}
-
 func (it *Iterator) prefetch() {
 	prefetchSize := 2
 	if it.opt.PrefetchValues && it.opt.PrefetchSize > 1 {
@@ -732,7 +703,7 @@ func (it *Iterator) prefetch() {
 	i := it.iitr
 	var count int
 	it.item = nil
-	for i.Valid() && hasPrefix(it) {
+	for i.Valid() {
 		if !it.parseItem() {
 			continue
 		}
@@ -747,9 +718,6 @@ func (it *Iterator) prefetch() {
 // smallest key greater than the provided key if iterating in the forward direction.
 // Behavior would be reversed if iterating backwards.
 func (it *Iterator) Seek(key []byte) {
-	if it.iitr == nil {
-		return
-	}
 	if len(key) > 0 {
 		it.txn.addReadKey(key)
 	}

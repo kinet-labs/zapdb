@@ -1,25 +1,37 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package badger
 
 import (
 	"encoding/hex"
-	"fmt"
+	"io/ioutil"
 	"math/rand"
-	"os"
+	"sync/atomic"
 	"time"
 
-	"github.com/kinet-labs/zapdb/table"
-	"github.com/kinet-labs/zapdb/y"
+	"github.com/dgraph-io/badger/v2/table"
+	"github.com/dgraph-io/badger/v2/y"
+	"github.com/pkg/errors"
 )
 
 func (s *levelsController) validate() error {
 	for _, l := range s.levels {
 		if err := l.validate(); err != nil {
-			return y.Wrap(err, "Levels Controller")
+			return errors.Wrap(err, "Levels Controller")
 		}
 	}
 	return nil
@@ -36,19 +48,18 @@ func (s *levelHandler) validate() error {
 	numTables := len(s.tables)
 	for j := 1; j < numTables; j++ {
 		if j >= len(s.tables) {
-			return fmt.Errorf("Level %d, j=%d numTables=%d", s.level, j, numTables)
+			return errors.Errorf("Level %d, j=%d numTables=%d", s.level, j, numTables)
 		}
 
 		if y.CompareKeys(s.tables[j-1].Biggest(), s.tables[j].Smallest()) >= 0 {
-			return fmt.Errorf(
-				"Inter: Biggest(j-1)[%d] \n%s\n vs Smallest(j)[%d]: \n%s\n: "+
-					"level=%d j=%d numTables=%d",
-				s.tables[j-1].ID(), hex.Dump(s.tables[j-1].Biggest()), s.tables[j].ID(),
-				hex.Dump(s.tables[j].Smallest()), s.level, j, numTables)
+			return errors.Errorf(
+				"Inter: Biggest(j-1) \n%s\n vs Smallest(j): \n%s\n: level=%d j=%d numTables=%d",
+				hex.Dump(s.tables[j-1].Biggest()), hex.Dump(s.tables[j].Smallest()),
+				s.level, j, numTables)
 		}
 
 		if y.CompareKeys(s.tables[j].Smallest(), s.tables[j].Biggest()) > 0 {
-			return fmt.Errorf(
+			return errors.Errorf(
 				"Intra: \n%s\n vs \n%s\n: level=%d j=%d numTables=%d",
 				hex.Dump(s.tables[j].Smallest()), hex.Dump(s.tables[j].Biggest()), s.level, j, numTables)
 		}
@@ -79,12 +90,12 @@ func (s *levelHandler) validate() error {
 
 // reserveFileID reserves a unique file id.
 func (s *levelsController) reserveFileID() uint64 {
-	id := s.nextFileID.Add(1)
+	id := atomic.AddUint64(&s.nextFileID, 1)
 	return id - 1
 }
 
 func getIDMap(dir string) map[uint64]struct{} {
-	fileInfos, err := os.ReadDir(dir)
+	fileInfos, err := ioutil.ReadDir(dir)
 	y.Check(err)
 	idMap := make(map[uint64]struct{})
 	for _, info := range fileInfos {
