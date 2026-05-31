@@ -11,7 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/kinet-labs/zapdb/v4/y"
+	"github.com/kinet-labs/zapdb/y"
 )
 
 type SimpleIterator struct {

@@ -17,10 +17,10 @@ import (
 	fbs "github.com/google/flatbuffers/go"
 	"github.com/klauspost/compress/s2"
 
-	"github.com/kinet-labs/zapdb/v4/fb"
-	"github.com/kinet-labs/zapdb/v4/options"
-	"github.com/kinet-labs/zapdb/v4/pb"
-	"github.com/kinet-labs/zapdb/v4/y"
+	"github.com/kinet-labs/zapdb/fb"
+	"github.com/kinet-labs/zapdb/options"
+	"github.com/kinet-labs/zapdb/pb"
+	"github.com/kinet-labs/zapdb/y"
 	"github.com/dgraph-io/ristretto/v2/z"
 )
 

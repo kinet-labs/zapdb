@@ -24,10 +24,10 @@ import (
 	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
 
-	"github.com/kinet-labs/zapdb/v4/fb"
-	"github.com/kinet-labs/zapdb/v4/options"
-	"github.com/kinet-labs/zapdb/v4/pb"
-	"github.com/kinet-labs/zapdb/v4/y"
+	"github.com/kinet-labs/zapdb/fb"
+	"github.com/kinet-labs/zapdb/options"
+	"github.com/kinet-labs/zapdb/pb"
+	"github.com/kinet-labs/zapdb/y"
 	"github.com/dgraph-io/ristretto/v2"
 	"github.com/dgraph-io/ristretto/v2/z"
 )

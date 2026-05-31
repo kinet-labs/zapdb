@@ -14,9 +14,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/kinet-labs/zapdb/v4"
-	"github.com/kinet-labs/zapdb/v4/options"
-	"github.com/kinet-labs/zapdb/v4/y"
+	"github.com/kinet-labs/zapdb"
+	"github.com/kinet-labs/zapdb/options"
+	"github.com/kinet-labs/zapdb/y"
 )
 
 var streamCmd = &cobra.Command{

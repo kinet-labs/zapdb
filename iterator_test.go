@@ -17,9 +17,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/kinet-labs/zapdb/v4/options"
-	"github.com/kinet-labs/zapdb/v4/table"
-	"github.com/kinet-labs/zapdb/v4/y"
+	"github.com/kinet-labs/zapdb/options"
+	"github.com/kinet-labs/zapdb/table"
+	"github.com/kinet-labs/zapdb/y"
 )
 
 type tableMock struct {

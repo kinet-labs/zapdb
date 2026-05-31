@@ -9,7 +9,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/kinet-labs/zapdb/v4/options"
+	"github.com/kinet-labs/zapdb/options"
 )
 
 func TestOptions(t *testing.T) {

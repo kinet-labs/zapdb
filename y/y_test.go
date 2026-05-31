@@ -16,7 +16,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/kinet-labs/zapdb/v4/pb"
+	"github.com/kinet-labs/zapdb/pb"
 	"github.com/dgraph-io/ristretto/v2/z"
 )
 

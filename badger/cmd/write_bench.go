@@ -21,10 +21,10 @@ import (
 	humanize "github.com/dustin/go-humanize"
 	"github.com/spf13/cobra"
 
-	"github.com/kinet-labs/zapdb/v4"
-	"github.com/kinet-labs/zapdb/v4/options"
-	"github.com/kinet-labs/zapdb/v4/pb"
-	"github.com/kinet-labs/zapdb/v4/y"
+	"github.com/kinet-labs/zapdb"
+	"github.com/kinet-labs/zapdb/options"
+	"github.com/kinet-labs/zapdb/pb"
+	"github.com/kinet-labs/zapdb/y"
 	"github.com/dgraph-io/ristretto/v2/z"
 )
 

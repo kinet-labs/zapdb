@@ -16,7 +16,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/kinet-labs/zapdb/v4/pb"
+	"github.com/kinet-labs/zapdb/pb"
 )
 
 // This test will result in deadlock for commits before this.

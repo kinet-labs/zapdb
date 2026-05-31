@@ -11,7 +11,7 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 
-	"github.com/kinet-labs/zapdb/v4/pb"
+	"github.com/kinet-labs/zapdb/pb"
 )
 
 // ErrChecksumMismatch is returned at checksum mismatch.

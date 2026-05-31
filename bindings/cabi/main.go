@@ -22,7 +22,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	badger "github.com/kinet-labs/zapdb/v4"
+	badger "github.com/kinet-labs/zapdb"
 )
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -17,7 +17,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/kinet-labs/zapdb/v4/y"
+	"github.com/kinet-labs/zapdb/y"
 )
 
 // AIX flock locks files, not descriptors. So, multiple descriptors cannot

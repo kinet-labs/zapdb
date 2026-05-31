@@ -12,8 +12,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/kinet-labs/zapdb/v4/table"
-	"github.com/kinet-labs/zapdb/v4/y"
+	"github.com/kinet-labs/zapdb/table"
+	"github.com/kinet-labs/zapdb/y"
 )
 
 func (s *levelsController) validate() error {

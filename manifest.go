@@ -18,9 +18,9 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/kinet-labs/zapdb/v4/options"
-	"github.com/kinet-labs/zapdb/v4/pb"
-	"github.com/kinet-labs/zapdb/v4/y"
+	"github.com/kinet-labs/zapdb/options"
+	"github.com/kinet-labs/zapdb/pb"
+	"github.com/kinet-labs/zapdb/y"
 )
 
 // Manifest represents the contents of the MANIFEST file in a Badger store.
